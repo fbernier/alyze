@@ -1,6 +1,60 @@
 pub mod sentence;
 pub mod word;
 
+/// Portable SWAR (SIMD-within-a-register) primitives shared by the word and sentence tokenizers.
+///
+/// These classify bytes a machine word at a time using pure integer arithmetic — no per-byte
+/// table loads, no x86 intrinsics, no nightly `std::simd` — so they stay stable-Rust and
+/// WASM-compatible while removing the load→load dependency that caps byte-at-a-time scanning.
+pub(crate) mod swar {
+    /// Number of bytes classified per SWAR iteration (the platform word size: 8 on 64-bit, 4 on
+    /// wasm32).
+    pub(crate) const WORD_BYTES: usize = size_of::<usize>();
+    /// High bit of every byte lane.
+    pub(crate) const SWAR_HIGH: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
+    /// `0x01` in every byte lane.
+    pub(crate) const SWAR_ONES: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
+
+    /// Loads the `WORD_BYTES` bytes at `pos` as a little-endian `usize`. Reading little-endian
+    /// regardless of host order keeps `trailing_zeros` pointing at the first (lowest-address) byte
+    /// lane on big-endian targets too.
+    ///
+    /// # Safety
+    /// `pos + WORD_BYTES <= bytes.len()` must hold.
+    #[inline(always)]
+    pub(crate) unsafe fn load_chunk(bytes: &[u8], pos: usize) -> usize {
+        // A `[u8; WORD_BYTES]` read has no alignment requirement, so the unaligned cast is sound.
+        usize::from_le_bytes(unsafe { *(bytes.as_ptr().add(pos) as *const [u8; WORD_BYTES]) })
+    }
+
+    /// Per-byte `lo <= byte <= hi` (requires `0 <= lo <= hi <= 0x7F`): sets each lane's high bit
+    /// when in range. Bytes >= 0x80 never match.
+    ///
+    /// Carry-safe: the comparisons run on the low 7 bits of each lane, so every per-lane addition
+    /// stays <= 0xFF and never carries into the neighboring lane. Lanes whose byte is >= 0x80 are
+    /// masked out via `& !x` at the end.
+    #[inline(always)]
+    pub(crate) fn swar_in_range(x: usize, lo: u8, hi: u8) -> usize {
+        // Outside this range the `0x80 - lo` / `0x7F - hi` broadcasts below would over/underflow
+        // and the per-lane adds could carry across lanes, silently misclassifying bytes.
+        debug_assert!(lo <= hi && hi <= 0x7F);
+        let lo7 = x & !SWAR_HIGH;
+        // High bit set iff lo7 >= lo  (lo7 + (0x80 - lo) reaches 0x80 exactly when lo7 >= lo).
+        let ge_lo = lo7.wrapping_add(SWAR_ONES * (0x80 - lo as usize));
+        // High bit set iff lo7 >  hi  (lo7 + (0x7F - hi) reaches 0x80 exactly when lo7 > hi).
+        let gt_hi = lo7.wrapping_add(SWAR_ONES * (0x7F - hi as usize));
+        ge_lo & !gt_hi & !x & SWAR_HIGH
+    }
+
+    /// Byte offset (within a SWAR chunk) of the first set high-bit lane in a boundary mask, e.g. as
+    /// produced by [`swar_in_range`] or a classifier built on it. `mask` must be nonzero, with only
+    /// each matched lane's high bit set (never other bits within a lane).
+    #[inline(always)]
+    pub(crate) fn first_boundary_byte(mask: usize) -> usize {
+        (mask.trailing_zeros() / 8) as usize
+    }
+}
+
 /// Helper to generate a state enum and associated constants.
 /// Ensures `ALL` and `NUM_VARIANTS` are always in sync with the actual variants.
 macro_rules! state_enum {
