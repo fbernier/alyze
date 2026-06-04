@@ -22,6 +22,7 @@ pub struct TokenProperties(u8);
 impl TokenProperties {
     const WORD_LIKE_MASK: u8 = 0b0000_0001;
     const NON_ASCII_MASK: u8 = 0b0000_0010;
+    const ASCII_UPPERCASE_MASK: u8 = 0b0000_0100;
 
     pub(crate) const NON_ASCII: Self = Self(Self::NON_ASCII_MASK);
     pub(crate) const WORD_LIKE: Self = Self(Self::WORD_LIKE_MASK);
@@ -41,6 +42,15 @@ impl TokenProperties {
     pub fn is_ascii(&self) -> bool {
         self.0 & Self::NON_ASCII_MASK == 0
     }
+
+    // Set disjunctively when the span contains at least one ASCII uppercase byte (`[A-Z]`).
+    // Computed for free during the tokenizer's existing byte scan, so a case-folding consumer can
+    // skip an entire per-token re-scan: an ASCII token with this bit unset is already lowercase.
+    // Only meaningful for ASCII spans — for non-ASCII spans the consumer must Unicode-lowercase
+    // regardless, so this bit is ignored there.
+    pub(crate) fn has_ascii_uppercase(&self) -> bool {
+        self.0 & Self::ASCII_UPPERCASE_MASK != 0
+    }
 }
 
 impl std::ops::BitOrAssign for TokenProperties {
@@ -54,6 +64,28 @@ impl std::ops::BitOrAssign for TokenProperties {
 /// (DFA) to efficiently determine word boundaries in Unicode text. Includes a number of fast-paths
 /// for common cases, e.g. ASCII.
 pub fn tokenize(
+    text: &str,
+    options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    // `false`: don't spend cycles deriving the ASCII-uppercase bit. Reported `TokenProperties`
+    // always have `has_ascii_uppercase() == false`.
+    tokenize_impl::<false>(text, options, on_breakpoint)
+}
+
+/// Same as [`tokenize`], but also populates [`TokenProperties::has_ascii_uppercase`]. Costs a few
+/// extra arithmetic ops per byte in the ASCII fast lane, so it's a separate entry point: callers
+/// that will case-fold (and thus read the bit) opt in, and everyone else pays nothing — the
+/// uppercase code is `const`-eliminated from the [`tokenize`] monomorphization.
+pub(crate) fn tokenize_with_ascii_uppercase(
+    text: &str,
+    options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    tokenize_impl::<true>(text, options, on_breakpoint)
+}
+
+fn tokenize_impl<const ASCII_UPPERCASE: bool>(
     text: &str,
     _options: Options,
     mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
@@ -96,11 +128,14 @@ pub fn tokenize(
             State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
         ) {
             let scan_start = pos;
-            let (end, word_like) = scan_word_continue(bytes, pos);
+            let (end, word_like, has_upper) = scan_word_continue::<ASCII_UPPERCASE>(bytes, pos);
             pos = end;
             if pos > scan_start {
                 if word_like {
                     token_props.0 |= TokenProperties::WORD_LIKE_MASK;
+                }
+                if ASCII_UPPERCASE && has_upper {
+                    token_props.0 |= TokenProperties::ASCII_UPPERCASE_MASK;
                 }
                 let last = bytes[pos - 1]; // Safe because we're not in State::StartOfText.
                 state = match last {
@@ -124,12 +159,19 @@ pub fn tokenize(
                 b as char,
                 ASCII_WORD_BREAK_PROP[b as usize],
                 1usize,
-                // Same `[a-zA-Z0-9]` classification the SWAR scan uses, so the single-char branch
-                // and the fast-lane run can't disagree on a byte's word-like contribution.
-                if is_ascii_alnum(b) {
-                    TokenProperties::WORD_LIKE
-                } else {
-                    TokenProperties(0)
+                // Same `[a-zA-Z0-9]` / `[A-Z]` classification the SWAR scan uses, so the
+                // single-char branch and the fast-lane run can't disagree on a byte's
+                // word-like / uppercase contribution.
+                {
+                    let mut p = if is_ascii_alnum(b) {
+                        TokenProperties::WORD_LIKE
+                    } else {
+                        TokenProperties(0)
+                    };
+                    if ASCII_UPPERCASE && b.is_ascii_uppercase() {
+                        p.0 |= TokenProperties::ASCII_UPPERCASE_MASK;
+                    }
+                    p
                 },
             )
         } else {
@@ -227,38 +269,65 @@ pub fn tokenize(
 }
 
 /// Scans the ASCII "word-continue" run `[a-zA-Z0-9_]` starting at `start`, returning the index of
-/// the first byte that is *not* word-continue (or `bytes.len()`), and whether the consumed run
-/// contained at least one alphanumeric char (i.e. is "word-like" — a run of only `_` is not).
+/// the first byte that is *not* word-continue (or `bytes.len()`), whether the consumed run
+/// contained at least one alphanumeric char (i.e. is "word-like" — a run of only `_` is not), and
+/// whether it contained at least one ASCII uppercase byte (`[A-Z]`).
+///
+/// When `ASCII_UPPERCASE`, the uppercase flag is computed in the same SWAR pass that's already
+/// touching these bytes, so a case-folding consumer can decide "this token is already lowercase,
+/// skip it" without a second per-token scan — see [`TokenProperties::has_ascii_uppercase`]. When
+/// `false`, all of that work is `const`-eliminated and `has_upper` is always `false`.
 ///
 /// This is the tokenizer's hottest loop on Latin-script text, so it classifies bytes with pure
 /// arithmetic (no per-byte table load: removes a load→load dependency that capped the original
 /// loop at ~1 cycle/byte) and processes a `usize` word at a time via SWAR.
 #[inline]
-fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool) {
+fn scan_word_continue<const ASCII_UPPERCASE: bool>(
+    bytes: &[u8],
+    start: usize,
+) -> (usize, bool, bool) {
     let mut pos = start;
     let mut word_like = false;
+    let mut has_upper = false;
 
     // SWAR fast lane: classify `WORD_BYTES` bytes per iteration. We only enter the word-at-a-time
     // path while a full word remains; the scalar tail below finishes the run.
     while pos + WORD_BYTES <= bytes.len() {
         // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`.
         let chunk = unsafe { load_chunk(bytes, pos) };
-        // Computed once and reused: word-continue is alphanumeric plus `_`, and `word_like`
-        // tracks the alphanumeric lanes.
-        let alnum = swar_alnum(chunk);
+        // Computed once and reused: word-continue is alphanumeric plus `_`, `word_like` tracks the
+        // alphanumeric lanes, and `upper` the `[A-Z]` lanes.
+        let is_alpha = swar_in_range(chunk | (SWAR_ONES * 0x20), b'a', b'z');
+        let alnum = is_alpha | swar_in_range(chunk, b'0', b'9');
+        // Uppercase = alpha lanes whose `0x20` case bit is clear. `is_alpha` already lives in the
+        // high bit of each lane; shifting the chunk left by 2 moves each lane's bit-5 (the `0x20`
+        // case bit) into that same high bit (5 + 2 = 7, stays within the lane), and `& !…` keeps
+        // the lanes where it was clear. Derived from `is_alpha` with no extra range test — and
+        // gated on `ASCII_UPPERCASE` so callers that don't read the bit emit none of it.
+        let upper = if ASCII_UPPERCASE {
+            is_alpha & !(chunk << 2) & SWAR_HIGH
+        } else {
+            0
+        };
         let cont = alnum | swar_in_range(chunk, b'_', b'_');
         let boundary = (!cont) & SWAR_HIGH;
         if boundary == 0 {
             // All `WORD_BYTES` bytes continue the word.
             word_like |= alnum != 0;
+            if ASCII_UPPERCASE {
+                has_upper |= upper != 0;
+            }
             pos += WORD_BYTES;
         } else {
             // First non-continue byte is at this offset within the chunk.
             let off = (boundary.trailing_zeros() / 8) as usize;
-            // Word-like if any consumed byte (those before the boundary) is alphanumeric.
+            // Only the lanes *before* the boundary are part of the run.
             let consumed_mask = boundary & boundary.wrapping_neg(); // lowest boundary high-bit
             word_like |= (alnum & (consumed_mask - 1)) != 0;
-            return (pos + off, word_like);
+            if ASCII_UPPERCASE {
+                has_upper |= (upper & (consumed_mask - 1)) != 0;
+            }
+            return (pos + off, word_like, has_upper);
         }
     }
 
@@ -270,9 +339,12 @@ fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool) {
             break;
         }
         word_like |= is_alnum;
+        if ASCII_UPPERCASE {
+            has_upper |= b.is_ascii_uppercase();
+        }
         pos += 1;
     }
-    (pos, word_like)
+    (pos, word_like, has_upper)
 }
 
 /// Branchless `[a-zA-Z0-9]` test for a single ASCII byte (false for bytes >= 0x80).
@@ -281,13 +353,6 @@ fn is_ascii_alnum(b: u8) -> bool {
     let is_alpha = (b | 0x20).wrapping_sub(b'a') < 26;
     let is_digit = b.wrapping_sub(b'0') < 10;
     is_alpha | is_digit
-}
-
-/// Per-byte ASCII alphanumeric `[a-zA-Z0-9]`: sets each lane's high bit when alphanumeric.
-#[inline(always)]
-fn swar_alnum(x: usize) -> usize {
-    let lower = x | (SWAR_ONES * 0x20);
-    swar_in_range(lower, b'a', b'z') | swar_in_range(x, b'0', b'9')
 }
 
 /// Cheap-path `TokenProperties` contribution for each `WordBreakProperty` value. Covers the
@@ -304,13 +369,14 @@ const WORD_BREAK_CONTRIB: [TokenProperties; WordBreakProperty::NUM_VARIANTS] = {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, scan_word_continue, tokenize};
+    use super::{Options, scan_word_continue, tokenize, tokenize_with_ascii_uppercase};
     use crate::uax29::test_helpers::test_against_uax29_break_tests;
 
     /// Trivially-correct reference: byte-at-a-time `[a-zA-Z0-9_]` scan.
-    fn scan_reference(bytes: &[u8], start: usize) -> (usize, bool) {
+    fn scan_reference(bytes: &[u8], start: usize) -> (usize, bool, bool) {
         let mut pos = start;
         let mut word_like = false;
+        let mut has_upper = false;
         while pos < bytes.len() {
             let b = bytes[pos];
             let is_alnum = b.is_ascii_alphanumeric();
@@ -318,9 +384,10 @@ mod tests {
                 break;
             }
             word_like |= is_alnum;
+            has_upper |= b.is_ascii_uppercase();
             pos += 1;
         }
-        (pos, word_like)
+        (pos, word_like, has_upper)
     }
 
     #[test]
@@ -333,9 +400,17 @@ mod tests {
                 buf.push(b);
                 buf.extend_from_slice(b"z9_more");
                 assert_eq!(
-                    scan_word_continue(&buf, 0),
+                    scan_word_continue::<true>(&buf, 0),
                     scan_reference(&buf, 0),
                     "prefix={prefix} byte={b:#04x}"
+                );
+                // The `false` variant must agree on the boundary and word-like flag, and never
+                // report uppercase (that work is `const`-eliminated).
+                let (end_t, wl_t, _) = scan_word_continue::<true>(&buf, 0);
+                assert_eq!(
+                    scan_word_continue::<false>(&buf, 0),
+                    (end_t, wl_t, false),
+                    "false-variant mismatch: prefix={prefix} byte={b:#04x}"
                 );
             }
         }
@@ -368,7 +443,7 @@ mod tests {
                 (rng() as usize) % (len + 1)
             };
             assert_eq!(
-                scan_word_continue(&buf, start),
+                scan_word_continue::<true>(&buf, start),
                 scan_reference(&buf, start),
                 "buf={buf:?} start={start}"
             );
@@ -552,6 +627,54 @@ mod tests {
         assert_word_like("   ", vec![(0, false), (3, false)]);
         // ASCII punctuation: each '!' breaks separately, none word-like.
         assert_word_like("!!!", vec![(0, false), (1, false), (2, false), (3, false)]);
+    }
+
+    /// The `has_ascii_uppercase` bit must be set iff the token contains an ASCII `[A-Z]` byte.
+    /// This is the signal the analyzer uses to skip re-scanning already-lowercase tokens, so it
+    /// has to agree exactly with a trivial per-byte check across single-char, SWAR-run, and
+    /// mixed spans.
+    #[test]
+    fn tokenizer_has_ascii_uppercase_sanity() {
+        fn assert_upper(s: &str, expected: Vec<(usize, bool)>) {
+            let mut got: Vec<(usize, bool)> = Vec::new();
+            tokenize_with_ascii_uppercase(s, Options::default(), |bp, props| {
+                got.push((bp, props.has_ascii_uppercase()));
+                true
+            });
+            assert_eq!(got, expected, "input: {:?}", s);
+
+            // The plain `tokenize` entry point never derives the bit (it's `const`-eliminated).
+            let mut plain: Vec<(usize, bool)> = Vec::new();
+            tokenize(s, Options::default(), |bp, props| {
+                plain.push((bp, props.has_ascii_uppercase()));
+                true
+            });
+            assert!(
+                plain.iter().all(|&(_, upper)| !upper),
+                "plain tokenize must not report uppercase: {:?}",
+                s
+            );
+        }
+
+        // All-lowercase / no letters → no uppercase bit.
+        assert_upper("hello", vec![(0, false), (5, false)]);
+        assert_upper("123", vec![(0, false), (3, false)]);
+        // Single uppercase char (single-char DFA path).
+        assert_upper("A", vec![(0, false), (1, true)]);
+        // Uppercase inside a long run (exercises the SWAR fast lane past one word).
+        assert_upper("abcdefghijK", vec![(0, false), (11, true)]);
+        // Uppercase exactly at a chunk boundary, then a non-word break char.
+        assert_upper("abcdefgH iJ", vec![
+            (0, false),
+            (8, true),  // "abcdefgH"
+            (9, false), // " "
+            (11, true), // "iJ"
+        ]);
+        // Mixed token whose only uppercase is ASCII while it's also non-ASCII overall: the bit
+        // still reflects the ASCII uppercase, even though the consumer ignores it for non-ASCII.
+        assert_upper("Café", vec![(0, false), ("Café".len(), true)]);
+        // Underscore-connected: uppercase tracked across ExtendNumLet joins.
+        assert_upper("a_B", vec![(0, false), (3, true)]);
     }
 
     /// Strict cases that need Script / Ideographic / OtherNumber / ExtPict lookups beyond the
