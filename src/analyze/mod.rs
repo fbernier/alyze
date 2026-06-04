@@ -165,6 +165,25 @@ impl Analyzer {
         &self,
         inputs: impl Iterator<Item = &'a str>,
         buffer: &mut ReusableBuffer,
+        callback: impl FnMut(Token<'_>) -> bool,
+    ) {
+        // Case-folding (lowercasing) only runs when not case-sensitive, and that's also the only
+        // time we read the tokenizer's ASCII-uppercase bit. Branch on it once, here, so each
+        // analysis monomorphizes separately: the case-sensitive one carries no case-folding or
+        // uppercase code at all (it's `const`-eliminated), staying as cheap as a tokenizer that
+        // never supported the bit — no shared `analyze_inputs` body whose layout the uppercase
+        // work could perturb.
+        if self.options.case_sensitive {
+            self.analyze_dispatch::<false>(inputs, buffer, callback);
+        } else {
+            self.analyze_dispatch::<true>(inputs, buffer, callback);
+        }
+    }
+
+    fn analyze_dispatch<'a, const CASE_FOLD: bool>(
+        &self,
+        inputs: impl Iterator<Item = &'a str>,
+        buffer: &mut ReusableBuffer,
         mut callback: impl FnMut(Token<'_>) -> bool,
     ) {
         let ReusableBuffer {
@@ -190,71 +209,102 @@ impl Analyzer {
         for (input_index, input) in inputs.enumerate() {
             let mut prev = None;
             let input_as_bytes = input.as_bytes();
-            uax29::word::tokenize(input, tokenizer_opts, |bp, props| {
-                let Some(prev) = std::mem::replace(&mut prev, Some(bp)) else {
-                    return true; // don't emit token on first breakpoint
-                };
-                if !props.is_word_like() {
-                    return true; // skip non-word tokens
-                }
 
-                // Advance position after each word-like token.
-                let position = next_position;
-                next_position += 1;
+            // Per-breakpoint logic, shared by both tokenizer entry points. A macro keeps it DRY
+            // while letting each `const` arm below pass the closure *by value* (so it inlines into
+            // the chosen tokenizer without a shared-reference indirection that would cost cycles).
+            macro_rules! on_breakpoint {
+                () => {
+                    |bp, props: uax29::word::TokenProperties| {
+                        let Some(prev) = std::mem::replace(&mut prev, Some(bp)) else {
+                            return true; // don't emit token on first breakpoint
+                        };
+                        if !props.is_word_like() {
+                            return true; // skip non-word tokens
+                        }
 
-                // SAFETY: tokenize guarentees that breakpoints are on valid UTF-8 boundaries,
-                // thus slicing input by the breakpoint will always produce valid UTF-8.
-                buffer_a.clear();
-                let mut token_text = InputRefOrBuffered::InputRef {
-                    input: unsafe { std::str::from_utf8_unchecked(&input_as_bytes[prev..bp]) },
-                    buffer_if_needed: buffer_a,
-                };
+                        // Advance position after each word-like token.
+                        let position = next_position;
+                        next_position += 1;
 
-                // Token length
-                if let Some(max_token_length) = self.options.maximum_token_length
-                    && !filters::within_token_length_limit(token_text.as_str(), max_token_length)
-                {
-                    return true;
-                }
+                        // SAFETY: tokenize guarentees that breakpoints are on valid UTF-8
+                        // boundaries, thus slicing input by the breakpoint always produces valid
+                        // UTF-8.
+                        buffer_a.clear();
+                        let mut token_text = InputRefOrBuffered::InputRef {
+                            input: unsafe {
+                                std::str::from_utf8_unchecked(&input_as_bytes[prev..bp])
+                            },
+                            buffer_if_needed: buffer_a,
+                        };
 
-                // Lowercasing
-                if !self.options.case_sensitive {
-                    token_text.lowercase_in_place(props.is_ascii());
-                }
+                        // Token length
+                        if let Some(max_token_length) = self.options.maximum_token_length
+                            && !filters::within_token_length_limit(
+                                token_text.as_str(),
+                                max_token_length,
+                            )
+                        {
+                            return true;
+                        }
 
-                // Stopword removal
-                if let Some(StopwordRemoval::ForLanguage(language)) = self.options.stopword_removal
-                    && filters::is_stopword_in_language(language, token_text.as_str())
-                {
-                    return true;
-                }
+                        // Lowercasing. The tokenizer already told us (for free, during its byte
+                        // scan) whether an ASCII token contains any uppercase, so we skip the
+                        // per-token re-scan and leave already-lowercase tokens borrowed untouched.
+                        // `const`-gated so the case-sensitive monomorphization emits none of it.
+                        if CASE_FOLD {
+                            token_text.lowercase_in_place(
+                                props.is_ascii(),
+                                Some(props.has_ascii_uppercase()),
+                            );
+                        }
 
-                // Stemming
-                if let Some(stemmer) = &stemmer {
-                    token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
-                }
+                        // Stopword removal
+                        if let Some(StopwordRemoval::ForLanguage(language)) =
+                            self.options.stopword_removal
+                            && filters::is_stopword_in_language(language, token_text.as_str())
+                        {
+                            return true;
+                        }
 
-                // ASCII folding
-                // Note: Not needed if token is already ASCII
-                if self.options.ascii_folding && !props.is_ascii() {
-                    token_text.ascii_fold_in_place(buffer_b);
+                        // Stemming
+                        if let Some(stemmer) = &stemmer {
+                            token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
+                        }
 
-                    // ASCII folding can produce uppercase ASCII characters,
-                    // so we'll lowercase again if case folding is enabled.
-                    if !self.options.case_sensitive {
-                        let is_ascii = token_text.as_str().is_ascii();
-                        token_text.lowercase_in_place(is_ascii);
+                        // ASCII folding
+                        // Note: Not needed if token is already ASCII
+                        if self.options.ascii_folding && !props.is_ascii() {
+                            token_text.ascii_fold_in_place(buffer_b);
+
+                            // ASCII folding can produce uppercase ASCII characters, so we lowercase
+                            // again. The token's bytes just changed, so the tokenizer's uppercase
+                            // hint no longer applies — re-detect (`None`).
+                            if CASE_FOLD {
+                                let is_ascii = token_text.as_str().is_ascii();
+                                token_text.lowercase_in_place(is_ascii, None);
+                            }
+                        }
+
+                        let token = Token {
+                            text: token_text.as_str(),
+                            position,
+                            byte_range: prev..bp,
+                            input_index,
+                        };
+                        callback(token)
                     }
-                }
-
-                let token = Token {
-                    text: token_text.as_str(),
-                    position,
-                    byte_range: prev..bp,
-                    input_index,
                 };
-                callback(token)
-            });
+            }
+
+            // Only the case-folding monomorphization asks the tokenizer to derive the uppercase
+            // bit; the `else` arm is `const`-eliminated here, so the case-sensitive path never
+            // even instantiates the uppercase-computing tokenizer.
+            if CASE_FOLD {
+                uax29::word::tokenize_with_ascii_uppercase(input, tokenizer_opts, on_breakpoint!());
+            } else {
+                uax29::word::tokenize(input, tokenizer_opts, on_breakpoint!());
+            }
         }
     }
 }
@@ -295,15 +345,35 @@ impl InputRefOrBuffered<'_, '_> {
         }
     }
 
-    fn lowercase_in_place(&mut self, is_ascii: bool) {
+    /// Lowercases the token in place. `is_ascii` must match `self.as_str().is_ascii()`.
+    ///
+    /// `ascii_has_uppercase` is an optional hint (from the tokenizer's scan) for ASCII tokens:
+    /// `Some(false)` means "no `[A-Z]`, nothing to do" and lets us skip the per-token re-scan;
+    /// `None` means "unknown, detect it" (used after ASCII folding mutates the bytes).
+    fn lowercase_in_place(&mut self, is_ascii: bool, ascii_has_uppercase: Option<bool>) {
         debug_assert_eq!(
             is_ascii,
             self.as_str().is_ascii(),
             "caller must ensure is_ascii is correct"
         );
 
-        if is_ascii && self.as_str().bytes().all(|b| !b.is_ascii_uppercase()) {
-            return;
+        if is_ascii {
+            let has_uppercase = match ascii_has_uppercase {
+                // Trust the tokenizer's hint, but in debug builds verify it against the bytes.
+                Some(hint) => {
+                    debug_assert_eq!(
+                        hint,
+                        self.as_str().bytes().any(|b| b.is_ascii_uppercase()),
+                        "uppercase hint must match the token's actual contents"
+                    );
+                    hint
+                }
+                // No hint (post-fold): detect it ourselves.
+                None => self.as_str().bytes().any(|b| b.is_ascii_uppercase()),
+            };
+            if !has_uppercase {
+                return;
+            }
         }
 
         if let Self::InputRef {
