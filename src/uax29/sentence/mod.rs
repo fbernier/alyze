@@ -2,6 +2,7 @@ pub(crate) mod properties;
 pub(crate) mod transitions;
 
 use crate::uax29::Action;
+use crate::uax29::swar::{SWAR_HIGH, WORD_BYTES, load_chunk, swar_in_range};
 use properties::{ASCII_SENTENCE_BREAK_PROP, lookup_sentence_break_property};
 use transitions::{State, TRANSITION_TABLE, Transition};
 
@@ -18,6 +19,31 @@ pub fn tokenize(text: &str, _options: Options, mut on_breakpoint: impl FnMut(usi
     let mut deferred_break_pos = None;
     let mut pos = 0;
     while pos < text.len() {
+        // Fast path: inside a sentence (states Any/Upper/Lower), every ASCII byte except the
+        // sentence-relevant ones (`. ! ? \n \r`) is a guaranteed NoBreak that lands back in one of
+        // these same three states (letters keep Upper/Lower for SB7; everything else → Any). So we
+        // can skip the per-byte property+transition table loads and scan a machine word at a time,
+        // stopping at the first byte that the DFA must actually inspect. Sentences are long, so
+        // this run covers the overwhelming majority of the input.
+        if matches!(state, State::Any | State::Upper | State::Lower) {
+            let end = scan_sentence_interior(bytes, pos);
+            if end > pos {
+                // Resulting state is determined solely by the last consumed byte (the DFA is
+                // Markovian within this run): an ASCII letter sets Upper/Lower (needed so a
+                // following ATerm enters LetterATerm for SB7), anything else resets to Any.
+                let last = bytes[end - 1];
+                state = if last.is_ascii_uppercase() {
+                    State::Upper
+                } else if last.is_ascii_lowercase() {
+                    State::Lower
+                } else {
+                    State::Any
+                };
+                pos = end;
+                continue;
+            }
+        }
+
         let b = bytes[pos];
         let (prop, char_len) = if b < 0x80 {
             (ASCII_SENTENCE_BREAK_PROP[b as usize], 1usize)
@@ -73,10 +99,121 @@ pub fn tokenize(text: &str, _options: Options, mut on_breakpoint: impl FnMut(usi
     _ = on_breakpoint(text.len());
 }
 
+/// Scans the "sentence interior" run starting at `start`, returning the index of the first byte
+/// that the sentence DFA must inspect — i.e. the first byte that is *not* a plain ASCII interior
+/// byte. A byte stops the scan iff it is non-ASCII (>= 0x80) or one of the sentence-relevant ASCII
+/// bytes: `\n` `\r` `!` `.` `?` (ParaSep / STerm / ATerm).
+///
+/// Only valid to call from states `Any`/`Upper`/`Lower`, where every other ASCII byte is a NoBreak
+/// that stays within those three states (see `tokenize` and the `Any`/`Upper`/`Lower` rows in
+/// `transitions.rs` — if those rows change, revisit `is_sentence_stop_byte`). We may stop *early*
+/// without affecting correctness (the DFA just resumes), so the rare control bytes `\x0B`/`\x0C`
+/// are folded into the `\n..=\r` test for free.
+#[inline]
+fn scan_sentence_interior(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start;
+
+    // SWAR fast lane: classify `WORD_BYTES` bytes per iteration with no per-byte table loads. This
+    // mirrors `is_sentence_stop_byte`, evaluated a machine word at a time.
+    while pos + WORD_BYTES <= bytes.len() {
+        // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`.
+        let chunk = unsafe { load_chunk(bytes, pos) };
+        // High bit set in every lane the DFA must inspect: non-ASCII, or a sentence-relevant byte.
+        let stop = (chunk & SWAR_HIGH)            // >= 0x80
+            | swar_in_range(chunk, 0x0A, 0x0D)    // \n \r (and rare \x0B \x0C, harmlessly)
+            | swar_in_range(chunk, b'!', b'!')    // STerm
+            | swar_in_range(chunk, b'.', b'.')    // ATerm
+            | swar_in_range(chunk, b'?', b'?'); // STerm
+        if stop == 0 {
+            pos += WORD_BYTES;
+        } else {
+            // First stop byte is at this lane offset within the chunk.
+            return pos + (stop.trailing_zeros() / 8) as usize;
+        }
+    }
+
+    // Scalar tail (and small inputs): same classification, one byte at a time.
+    while pos < bytes.len() && !is_sentence_stop_byte(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// A byte the sentence DFA must inspect from an interior state: non-ASCII (>= 0x80) or one of the
+/// sentence-relevant ASCII bytes `\n` `\r` `!` `.` `?` (ParaSep / STerm / ATerm). The rare control
+/// bytes `\x0B`/`\x0C` are included for free (stopping early is harmless). Kept in lockstep with
+/// the SWAR classification in `scan_sentence_interior`.
+#[inline(always)]
+fn is_sentence_stop_byte(b: u8) -> bool {
+    b >= 0x80 || matches!(b, b'\n' | 0x0B | 0x0C | b'\r' | b'!' | b'.' | b'?')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Options, tokenize};
+    use super::{Options, is_sentence_stop_byte, scan_sentence_interior, tokenize};
     use crate::uax29::test_helpers::test_against_uax29_break_tests;
+
+    /// Trivially-correct reference: byte-at-a-time scan that stops at the first byte the sentence
+    /// DFA must inspect.
+    fn scan_reference(bytes: &[u8], start: usize) -> usize {
+        let mut pos = start;
+        while pos < bytes.len() && !is_sentence_stop_byte(bytes[pos]) {
+            pos += 1;
+        }
+        pos
+    }
+
+    #[test]
+    fn scan_sentence_interior_matches_reference() {
+        // Exhaustive: every single byte value, at every alignment offset within a chunk, with an
+        // interior-byte prefix so the SWAR lane containing the byte varies.
+        for prefix in 0..=16usize {
+            for b in 0..=255u8 {
+                let mut buf = vec![b'a'; prefix];
+                buf.push(b);
+                buf.extend_from_slice(b"bc de.");
+                assert_eq!(
+                    scan_sentence_interior(&buf, 0),
+                    scan_reference(&buf, 0),
+                    "prefix={prefix} byte={b:#04x}"
+                );
+            }
+        }
+
+        // Randomized multi-byte inputs across the full byte range (biased toward interior bytes so
+        // we exercise long runs and boundaries at every offset).
+        let mut state: u64 = 0x243F6A8885A308D3;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let len = (rng() % 40) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rng();
+                    if r % 4 == 0 {
+                        (r >> 8) as u8 // full range, includes non-ASCII & stop bytes
+                    } else {
+                        let alphabet = b"abcXYZ0189 ,.!?\n";
+                        alphabet[(r >> 8) as usize % alphabet.len()]
+                    }
+                })
+                .collect();
+            let start = if len == 0 {
+                0
+            } else {
+                (rng() as usize) % (len + 1)
+            };
+            assert_eq!(
+                scan_sentence_interior(&buf, start),
+                scan_reference(&buf, start),
+                "buf={buf:?} start={start}"
+            );
+        }
+    }
 
     #[test]
     fn test_sentence_break_against_uax29_tests() {
