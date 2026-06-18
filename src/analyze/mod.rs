@@ -173,14 +173,25 @@ impl Analyzer {
         // uppercase code at all (it's `const`-eliminated), staying as cheap as a tokenizer that
         // never supported the bit — no shared `analyze_inputs` body whose layout the uppercase
         // work could perturb.
-        if self.options.case_sensitive {
-            self.analyze_dispatch::<false>(inputs, buffer, callback);
-        } else {
-            self.analyze_dispatch::<true>(inputs, buffer, callback);
+        // Second const axis: `FAST` = no per-token filter is configured (no length cap, no
+        // stopword removal, no stemming, no ASCII folding). When set, every filter block below is
+        // `const`-eliminated, shrinking the per-breakpoint closure enough that LLVM inlines it into
+        // the tokenizer instead of emitting it out of line — removing a `call` + register
+        // save/restore per emitted token. Filtered configs (dominated by stemmer/stopword cost
+        // anyway) stay on the full path. The four combinations match the existing CASE_FOLD split.
+        let fast = self.options.maximum_token_length.is_none()
+            && self.options.stopword_removal.is_none()
+            && self.options.stemming.is_none()
+            && !self.options.ascii_folding;
+        match (self.options.case_sensitive, fast) {
+            (true, true) => self.analyze_dispatch::<false, true>(inputs, buffer, callback),
+            (true, false) => self.analyze_dispatch::<false, false>(inputs, buffer, callback),
+            (false, true) => self.analyze_dispatch::<true, true>(inputs, buffer, callback),
+            (false, false) => self.analyze_dispatch::<true, false>(inputs, buffer, callback),
         }
     }
 
-    fn analyze_dispatch<'a, const CASE_FOLD: bool>(
+    fn analyze_dispatch<'a, const CASE_FOLD: bool, const FAST: bool>(
         &self,
         inputs: impl Iterator<Item = &'a str>,
         buffer: &mut ReusableBuffer,
@@ -211,8 +222,11 @@ impl Analyzer {
             let input_as_bytes = input.as_bytes();
 
             // Per-breakpoint logic, shared by both tokenizer entry points. A macro keeps it DRY
-            // while letting each `const` arm below pass the closure *by value* (so it inlines into
-            // the chosen tokenizer without a shared-reference indirection that would cost cycles).
+            // while letting each `const` arm below pass the closure *by value*, so the tokenizer
+            // monomorphizes over it and dispatches statically — no `dyn FnMut`/vtable indirection.
+            // Under `FAST` the filter blocks `const`-eliminate, leaving a body small enough that
+            // LLVM inlines it into the tokenizer (no per-token call boundary); the filtered
+            // (`!FAST`) monomorphization keeps the transform code and may stay out of line.
             macro_rules! on_breakpoint {
                 () => {
                     |bp, props: uax29::word::TokenProperties| {
@@ -239,7 +253,8 @@ impl Analyzer {
                         };
 
                         // Token length
-                        if let Some(max_token_length) = self.options.maximum_token_length
+                        if !FAST
+                            && let Some(max_token_length) = self.options.maximum_token_length
                             && !filters::within_token_length_limit(
                                 token_text.as_str(),
                                 max_token_length,
@@ -260,21 +275,22 @@ impl Analyzer {
                         }
 
                         // Stopword removal
-                        if let Some(StopwordRemoval::ForLanguage(language)) =
-                            self.options.stopword_removal
+                        if !FAST
+                            && let Some(StopwordRemoval::ForLanguage(language)) =
+                                self.options.stopword_removal
                             && filters::is_stopword_in_language(language, token_text.as_str())
                         {
                             return true;
                         }
 
                         // Stemming
-                        if let Some(stemmer) = &stemmer {
+                        if !FAST && let Some(stemmer) = &stemmer {
                             token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
                         }
 
                         // ASCII folding
                         // Note: Not needed if token is already ASCII
-                        if self.options.ascii_folding && !props.is_ascii() {
+                        if !FAST && self.options.ascii_folding && !props.is_ascii() {
                             token_text.ascii_fold_in_place(buffer_b);
 
                             // ASCII folding can produce uppercase ASCII characters, so we lowercase
