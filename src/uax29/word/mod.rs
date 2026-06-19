@@ -52,6 +52,9 @@ impl std::ops::BitOrAssign for TokenProperties {
 /// A tokenizer that implements UAX #29 word boundary rules, using a deterministic finite automaton
 /// (DFA) to efficiently determine word boundaries in Unicode text. Includes a number of fast-paths
 /// for common cases, e.g. ASCII.
+// `#[inline]` so the DFA loop fuses with the caller's per-breakpoint closure: `analyze`'s fast path
+// needs that closure inlined here to drop the per-token call boundary.
+#[inline]
 pub fn tokenize(
     text: &str,
     _options: Options,

@@ -32,6 +32,25 @@ impl AnalysisOptions {
         }
         true
     }
+
+    /// No per-token filter is configured: no length cap, stopword removal, stemming, or ASCII
+    /// folding. Selects the fast analyze monomorphization.
+    fn has_no_token_filters(&self) -> bool {
+        // Exhaustive destructure (no `..`): a new `AnalysisOptions` field won't compile until it's
+        // classified here, keeping this predicate in lockstep with the `!FAST`-gated filter blocks.
+        let AnalysisOptions {
+            tokenizer: _,
+            case_sensitive: _, // not per-token filters
+            maximum_token_length,
+            stopword_removal,
+            stemming,
+            ascii_folding,
+        } = self;
+        maximum_token_length.is_none()
+            && stopword_removal.is_none()
+            && stemming.is_none()
+            && !*ascii_folding
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +184,22 @@ impl Analyzer {
         &self,
         inputs: impl Iterator<Item = &'a str>,
         buffer: &mut ReusableBuffer,
+        callback: impl FnMut(Token<'_>) -> bool,
+    ) {
+        // On the FAST path every filter block `const`-eliminates, shrinking the per-breakpoint
+        // closure enough for LLVM to inline it into the tokenizer and drop the per-token call
+        // boundary.
+        if self.options.has_no_token_filters() {
+            self.analyze_dispatch::<true>(inputs, buffer, callback);
+        } else {
+            self.analyze_dispatch::<false>(inputs, buffer, callback);
+        }
+    }
+
+    fn analyze_dispatch<'a, const FAST: bool>(
+        &self,
+        inputs: impl Iterator<Item = &'a str>,
+        buffer: &mut ReusableBuffer,
         mut callback: impl FnMut(Token<'_>) -> bool,
     ) {
         let ReusableBuffer {
@@ -173,10 +208,16 @@ impl Analyzer {
             stemming_cache,
         } = buffer;
 
-        let stemmer = self.options.stemming.map(|stemming_language| {
-            let algorithm = stemming_language.into();
-            rust_stemmers::Stemmer::create(algorithm)
-        });
+        // Gated on `!FAST` so the allocating `Stemmer::create` is statically dead on the fast path
+        // and `stemmer` folds to `None`.
+        let stemmer = if !FAST {
+            self.options.stemming.map(|stemming_language| {
+                let algorithm = stemming_language.into();
+                rust_stemmers::Stemmer::create(algorithm)
+            })
+        } else {
+            None
+        };
 
         // Monotonic across all inputs. Every word-like token consumes
         // a position, even if a downstream filter (length, stopword) drops it,
@@ -211,7 +252,8 @@ impl Analyzer {
                 };
 
                 // Token length
-                if let Some(max_token_length) = self.options.maximum_token_length
+                if !FAST
+                    && let Some(max_token_length) = self.options.maximum_token_length
                     && !filters::within_token_length_limit(token_text.as_str(), max_token_length)
                 {
                     return true;
@@ -222,28 +264,32 @@ impl Analyzer {
                     token_text.lowercase_in_place(props.is_ascii());
                 }
 
-                // Stopword removal
-                if let Some(StopwordRemoval::ForLanguage(language)) = self.options.stopword_removal
-                    && filters::is_stopword_in_language(language, token_text.as_str())
-                {
-                    return true;
-                }
+                // Post-lowercase filters; the whole block `const`-eliminates under `FAST`.
+                if !FAST {
+                    // Stopword removal
+                    if let Some(StopwordRemoval::ForLanguage(language)) =
+                        self.options.stopword_removal
+                        && filters::is_stopword_in_language(language, token_text.as_str())
+                    {
+                        return true;
+                    }
 
-                // Stemming
-                if let Some(stemmer) = &stemmer {
-                    token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
-                }
+                    // Stemming
+                    if let Some(stemmer) = &stemmer {
+                        token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
+                    }
 
-                // ASCII folding
-                // Note: Not needed if token is already ASCII
-                if self.options.ascii_folding && !props.is_ascii() {
-                    token_text.ascii_fold_in_place(buffer_b);
+                    // ASCII folding
+                    // Note: Not needed if token is already ASCII
+                    if self.options.ascii_folding && !props.is_ascii() {
+                        token_text.ascii_fold_in_place(buffer_b);
 
-                    // ASCII folding can produce uppercase ASCII characters,
-                    // so we'll lowercase again if case folding is enabled.
-                    if !self.options.case_sensitive {
-                        let is_ascii = token_text.as_str().is_ascii();
-                        token_text.lowercase_in_place(is_ascii);
+                        // ASCII folding can produce uppercase ASCII characters,
+                        // so we'll lowercase again if case folding is enabled.
+                        if !self.options.case_sensitive {
+                            let is_ascii = token_text.as_str().is_ascii();
+                            token_text.lowercase_in_place(is_ascii);
+                        }
                     }
                 }
 

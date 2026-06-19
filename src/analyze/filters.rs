@@ -44,6 +44,7 @@ pub(crate) fn within_token_length_limit(s: &str, maximum_token_length: usize) ->
         && (s.len() <= maximum_token_length || s.chars().nth(maximum_token_length).is_none())
 }
 
+#[inline]
 pub(crate) fn is_stopword_in_language(language: LanguageWithStopwords, token: &str) -> bool {
     match language {
         LanguageWithStopwords::Danish => stopwords::DANISH.contains(token),
