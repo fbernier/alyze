@@ -64,6 +64,18 @@ pub(crate) mod test_helpers {
 
     use itertools::{EitherOrBoth, Itertools};
 
+    /// Deterministic xorshift64 PRNG for the randomized differential tests. Returns a closure that
+    /// yields a fresh `u64` per call; pass each test a distinct seed so their inputs don't coincide.
+    pub fn xorshift64(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
     /// A helper enum to represent the expected sequence of codepoints and break points in a test case.
     #[derive(Debug, PartialEq)]
     pub enum SequenceItem {

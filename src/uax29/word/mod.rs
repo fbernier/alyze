@@ -95,17 +95,12 @@ pub fn tokenize(
             State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
         ) {
             let scan_start = pos;
-            let mut fast_acc: u8 = 0;
-            while pos < text.len() && bytes[pos] < 0x80 {
-                let info = ASCII_BYTE_INFO[bytes[pos] as usize];
-                if info & ASCII_WORD_CONTINUE == 0 {
-                    break;
-                }
-                fast_acc |= info;
-                pos += 1;
-            }
+            let (end, word_like) = scan_word_continue(bytes, pos);
+            pos = end;
             if pos > scan_start {
-                token_props.0 |= fast_acc & !ASCII_WORD_CONTINUE;
+                if word_like {
+                    token_props.0 |= TokenProperties::WORD_LIKE_MASK;
+                }
                 let last = bytes[pos - 1]; // Safe because we're not in State::StartOfText.
                 state = match last {
                     b'0'..=b'9' => State::Numeric,
@@ -128,7 +123,13 @@ pub fn tokenize(
                 b as char,
                 ASCII_WORD_BREAK_PROP[b as usize],
                 1usize,
-                TokenProperties(ASCII_BYTE_INFO[b as usize] & !ASCII_WORD_CONTINUE),
+                // Same `[a-zA-Z0-9]` classification the SWAR scan uses, so the single-char branch
+                // and the fast-lane run can't disagree on a byte's word-like contribution.
+                if is_ascii_alnum(b) {
+                    TokenProperties::WORD_LIKE
+                } else {
+                    TokenProperties(0)
+                },
             )
         } else {
             let c = text[pos..].chars().next().unwrap();
@@ -224,6 +225,100 @@ pub fn tokenize(
     _ = on_breakpoint(text.len(), token_props);
 }
 
+/// Scans the ASCII "word-continue" run `[a-zA-Z0-9_]` starting at `start`. Returns the index of
+/// the first byte that *isn't* word-continue (or `bytes.len()`), along with whether the run held
+/// any alphanumeric char — a run of only `_` doesn't count as "word-like".
+///
+/// This is the tokenizer's hottest loop on Latin-script text, so rather than look each byte up in
+/// a table it leans on the SWAR helpers to classify a whole `usize` of bytes at once. That table
+/// lookup, and the load→load dependency it creates, is what capped the old loop at ~1 cycle/byte.
+#[inline]
+fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool) {
+    let mut pos = start;
+    let mut word_like = false;
+
+    // SWAR fast lane: classify `WORD_BYTES` bytes per iteration. We only enter the word-at-a-time
+    // path while a full word remains; the scalar tail below finishes the run.
+    while pos + WORD_BYTES <= bytes.len() {
+        // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`, so the
+        // `WORD_BYTES` bytes read here are in bounds. A `[u8; WORD_BYTES]` read has no alignment
+        // requirement, so the unaligned pointer cast is sound.
+        let chunk = usize::from_le_bytes(unsafe {
+            *(bytes.as_ptr().add(pos) as *const [u8; WORD_BYTES])
+        });
+        // Computed once and reused: word-continue is alphanumeric plus `_`, and `word_like`
+        // tracks the alphanumeric lanes.
+        let alnum = swar_alnum(chunk);
+        let cont = alnum | swar_in_range(chunk, b'_', b'_');
+        let boundary = (!cont) & SWAR_HIGH;
+        if boundary == 0 {
+            // All `WORD_BYTES` bytes continue the word.
+            word_like |= alnum != 0;
+            pos += WORD_BYTES;
+        } else {
+            // First non-continue byte is at this offset within the chunk.
+            let off = (boundary.trailing_zeros() / 8) as usize;
+            // Word-like if any consumed byte (those before the boundary) is alphanumeric.
+            let consumed_mask = boundary & boundary.wrapping_neg(); // lowest boundary high-bit
+            word_like |= (alnum & (consumed_mask - 1)) != 0;
+            return (pos + off, word_like);
+        }
+    }
+
+    // Scalar tail (and small inputs): same classification, one byte at a time.
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        let is_alnum = is_ascii_alnum(b);
+        if !(is_alnum | (b == b'_')) {
+            break;
+        }
+        word_like |= is_alnum;
+        pos += 1;
+    }
+    (pos, word_like)
+}
+
+/// Number of bytes classified per SWAR iteration (the platform word size).
+const WORD_BYTES: usize = size_of::<usize>();
+/// High bit of every byte lane.
+const SWAR_HIGH: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
+/// `0x01` in every byte lane.
+const SWAR_ONES: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
+
+/// Branchless `[a-zA-Z0-9]` test for a single ASCII byte (false for bytes >= 0x80).
+#[inline(always)]
+fn is_ascii_alnum(b: u8) -> bool {
+    let is_alpha = (b | 0x20).wrapping_sub(b'a') < 26;
+    let is_digit = b.wrapping_sub(b'0') < 10;
+    is_alpha | is_digit
+}
+
+/// Per-byte `lo <= byte <= hi` (requires `0 <= lo <= hi <= 0x7F`): sets each lane's high bit when
+/// in range. Bytes >= 0x80 never match.
+///
+/// Carry-safe: the comparisons run on the low 7 bits of each lane, so every per-lane addition
+/// stays <= 0xFF and never carries into the neighboring lane. Lanes whose byte is >= 0x80 are
+/// masked out via `& !x` at the end.
+#[inline(always)]
+fn swar_in_range(x: usize, lo: u8, hi: u8) -> usize {
+    // Outside this range the `0x80 - lo` / `0x7F - hi` broadcasts below would over/underflow and
+    // the per-lane adds could carry across lanes, silently misclassifying bytes.
+    debug_assert!(lo <= hi && hi <= 0x7F);
+    let lo7 = x & !SWAR_HIGH;
+    // High bit set iff lo7 >= lo  (lo7 + (0x80 - lo) reaches 0x80 exactly when lo7 >= lo).
+    let ge_lo = lo7.wrapping_add(SWAR_ONES * (0x80 - lo as usize));
+    // High bit set iff lo7 >  hi  (lo7 + (0x7F - hi) reaches 0x80 exactly when lo7 > hi).
+    let gt_hi = lo7.wrapping_add(SWAR_ONES * (0x7F - hi as usize));
+    ge_lo & !gt_hi & !x & SWAR_HIGH
+}
+
+/// Per-byte ASCII alphanumeric `[a-zA-Z0-9]`: sets each lane's high bit when alphanumeric.
+#[inline(always)]
+fn swar_alnum(x: usize) -> usize {
+    let lower = x | (SWAR_ONES * 0x20);
+    swar_in_range(lower, b'a', b'z') | swar_in_range(x, b'0', b'9')
+}
+
 /// Cheap-path `TokenProperties` contribution for each `WordBreakProperty` value. Covers the
 /// signals that fall out of WordBreak alone — letters and digits. Katakana is intentionally
 /// **not** included: its set mixes Katakana letters (word-like) with the prolonged-sound mark
@@ -236,34 +331,68 @@ const WORD_BREAK_CONTRIB: [TokenProperties; WordBreakProperty::NUM_VARIANTS] = {
     t
 };
 
-/// Per-ASCII-byte info for the fast-path scan and the single-char branch.
-/// - Bit 7 (`ASCII_WORD_CONTINUE`): byte is part of a word-like run (`[a-zA-Z0-9_]`).
-/// - Low bits: the byte's `TokenProperties` contribution (currently just `WORD_LIKE_MASK` for
-///   `[a-zA-Z0-9]`, since underscore continues the run but isn't itself word-like).
-const ASCII_WORD_CONTINUE: u8 = 0b1000_0000;
-const ASCII_BYTE_INFO: [u8; 128] = {
-    let mut t = [0u8; 128];
-    let mut i = 0u8;
-    loop {
-        t[i as usize] = match i {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
-                ASCII_WORD_CONTINUE | TokenProperties::WORD_LIKE_MASK
-            }
-            b'_' => ASCII_WORD_CONTINUE,
-            _ => 0,
-        };
-        if i == 127 {
-            break;
-        }
-        i += 1;
-    }
-    t
-};
-
 #[cfg(test)]
 mod tests {
-    use super::{Options, tokenize};
-    use crate::uax29::test_helpers::test_against_uax29_break_tests;
+    use super::{Options, scan_word_continue, tokenize};
+    use crate::uax29::test_helpers::{test_against_uax29_break_tests, xorshift64};
+
+    /// Trivially-correct reference: byte-at-a-time `[a-zA-Z0-9_]` scan.
+    fn scan_reference(bytes: &[u8], start: usize) -> (usize, bool) {
+        let mut pos = start;
+        let mut word_like = false;
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            let is_alnum = b.is_ascii_alphanumeric();
+            if !(is_alnum || b == b'_') {
+                break;
+            }
+            word_like |= is_alnum;
+            pos += 1;
+        }
+        (pos, word_like)
+    }
+
+    #[test]
+    fn scan_word_continue_matches_reference() {
+        // Exhaustive: every single byte value, at every alignment offset within a chunk, with a
+        // word-continue prefix so the SWAR lane that contains the byte varies.
+        for prefix in 0..=16usize {
+            for b in 0..=255u8 {
+                let mut buf = vec![b'a'; prefix];
+                buf.push(b);
+                buf.extend_from_slice(b"z9_more");
+                assert_eq!(
+                    scan_word_continue(&buf, 0),
+                    scan_reference(&buf, 0),
+                    "prefix={prefix} byte={b:#04x}"
+                );
+            }
+        }
+
+        // Randomized multi-byte inputs across the full byte range (biased toward word chars so we
+        // exercise long runs and boundaries at every offset).
+        let mut rng = xorshift64(0x9E3779B97F4A7C15);
+        for _ in 0..200_000 {
+            let len = (rng() % 40) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rng();
+                    if r % 4 == 0 {
+                        (r >> 8) as u8 // full range, includes non-ASCII & punctuation
+                    } else {
+                        let alphabet = b"abcXYZ0189_ .,";
+                        alphabet[(r >> 8) as usize % alphabet.len()]
+                    }
+                })
+                .collect();
+            let start = if len == 0 { 0 } else { (rng() as usize) % (len + 1) };
+            assert_eq!(
+                scan_word_continue(&buf, start),
+                scan_reference(&buf, start),
+                "buf={buf:?} start={start}"
+            );
+        }
+    }
 
     #[test]
     fn test_word_break_against_uax29_tests() {
