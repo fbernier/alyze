@@ -2,6 +2,7 @@ pub(crate) mod properties;
 pub(crate) mod transitions;
 
 use crate::uax29::Action;
+use crate::uax29::swar::{SWAR_HIGH, SWAR_ONES, WORD_BYTES, load_chunk, swar_in_range};
 use properties::{
     ASCII_WORD_BREAK_PROP, WordBreakProperty, is_word_like_strict,
     lookup_word_break_property_from_dictionary,
@@ -240,12 +241,8 @@ fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool) {
     // SWAR fast lane: classify `WORD_BYTES` bytes per iteration. We only enter the word-at-a-time
     // path while a full word remains; the scalar tail below finishes the run.
     while pos + WORD_BYTES <= bytes.len() {
-        // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`, so the
-        // `WORD_BYTES` bytes read here are in bounds. A `[u8; WORD_BYTES]` read has no alignment
-        // requirement, so the unaligned pointer cast is sound.
-        let chunk = usize::from_le_bytes(unsafe {
-            *(bytes.as_ptr().add(pos) as *const [u8; WORD_BYTES])
-        });
+        // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`.
+        let chunk = unsafe { load_chunk(bytes, pos) };
         // Computed once and reused: word-continue is alphanumeric plus `_`, and `word_like`
         // tracks the alphanumeric lanes.
         let alnum = swar_alnum(chunk);
@@ -278,38 +275,12 @@ fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool) {
     (pos, word_like)
 }
 
-/// Number of bytes classified per SWAR iteration (the platform word size).
-const WORD_BYTES: usize = size_of::<usize>();
-/// High bit of every byte lane.
-const SWAR_HIGH: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
-/// `0x01` in every byte lane.
-const SWAR_ONES: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
-
 /// Branchless `[a-zA-Z0-9]` test for a single ASCII byte (false for bytes >= 0x80).
 #[inline(always)]
 fn is_ascii_alnum(b: u8) -> bool {
     let is_alpha = (b | 0x20).wrapping_sub(b'a') < 26;
     let is_digit = b.wrapping_sub(b'0') < 10;
     is_alpha | is_digit
-}
-
-/// Per-byte `lo <= byte <= hi` (requires `0 <= lo <= hi <= 0x7F`): sets each lane's high bit when
-/// in range. Bytes >= 0x80 never match.
-///
-/// Carry-safe: the comparisons run on the low 7 bits of each lane, so every per-lane addition
-/// stays <= 0xFF and never carries into the neighboring lane. Lanes whose byte is >= 0x80 are
-/// masked out via `& !x` at the end.
-#[inline(always)]
-fn swar_in_range(x: usize, lo: u8, hi: u8) -> usize {
-    // Outside this range the `0x80 - lo` / `0x7F - hi` broadcasts below would over/underflow and
-    // the per-lane adds could carry across lanes, silently misclassifying bytes.
-    debug_assert!(lo <= hi && hi <= 0x7F);
-    let lo7 = x & !SWAR_HIGH;
-    // High bit set iff lo7 >= lo  (lo7 + (0x80 - lo) reaches 0x80 exactly when lo7 >= lo).
-    let ge_lo = lo7.wrapping_add(SWAR_ONES * (0x80 - lo as usize));
-    // High bit set iff lo7 >  hi  (lo7 + (0x7F - hi) reaches 0x80 exactly when lo7 > hi).
-    let gt_hi = lo7.wrapping_add(SWAR_ONES * (0x7F - hi as usize));
-    ge_lo & !gt_hi & !x & SWAR_HIGH
 }
 
 /// Per-byte ASCII alphanumeric `[a-zA-Z0-9]`: sets each lane's high bit when alphanumeric.
@@ -385,7 +356,11 @@ mod tests {
                     }
                 })
                 .collect();
-            let start = if len == 0 { 0 } else { (rng() as usize) % (len + 1) };
+            let start = if len == 0 {
+                0
+            } else {
+                (rng() as usize) % (len + 1)
+            };
             assert_eq!(
                 scan_word_continue(&buf, start),
                 scan_reference(&buf, start),
