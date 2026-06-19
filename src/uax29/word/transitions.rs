@@ -1,4 +1,8 @@
-use crate::uax29::{Action, state_enum, word::properties::WordBreakProperty};
+use crate::uax29::{
+    Action, state_enum,
+    word::TokenProperties,
+    word::properties::{ASCII_WORD_BREAK_PROP, WordBreakProperty},
+};
 
 // State values for the word break state machine. These are
 // an implementation detail of UAX#29, not documented in the spec.
@@ -55,6 +59,44 @@ pub(crate) const TABLE: [Row; State::NUM_VARIANTS] = [
     hletter_dq_transitions(),
     hletter_sq_transitions(),
 ];
+
+/// One precomputed per-character DFA step for an ASCII byte. Collapses the two dependent lookups
+/// the scalar loop used to do (`byte → WordBreakProperty`, then `[state][prop] → Transition`) into
+/// a single indexed load, and carries the byte's `TokenProperties` contribution so the hot loop
+/// needs no per-character re-classification.
+#[derive(Clone, Copy)]
+pub(crate) struct AsciiCell {
+    pub(crate) next_state: State,
+    pub(crate) action: Action,
+    pub(crate) char_props: TokenProperties,
+}
+
+/// Merged ASCII transition table: `ASCII_WORD_TRANSITION[state][byte]` is the full DFA step for
+/// `byte < 0x80`. Derived entirely from [`TABLE`] and [`ASCII_WORD_BREAK_PROP`], so it cannot drift
+/// from the canonical state machine — `ascii_word_transition_matches_table` asserts the equivalence.
+/// ~1920 cells; fits comfortably in L1.
+pub(crate) const ASCII_WORD_TRANSITION: [[AsciiCell; 128]; State::NUM_VARIANTS] = {
+    let mut table = [[AsciiCell {
+        next_state: State::Any,
+        action: Action::Break,
+        char_props: TokenProperties::EMPTY,
+    }; 128]; State::NUM_VARIANTS];
+    let mut s = 0;
+    while s < State::NUM_VARIANTS {
+        let mut b = 0usize;
+        while b < 128 {
+            let Transition(next_state, action) = TABLE[s][ASCII_WORD_BREAK_PROP[b] as usize];
+            table[s][b] = AsciiCell {
+                next_state,
+                action,
+                char_props: TokenProperties::from_ascii_byte(b as u8),
+            };
+            b += 1;
+        }
+        s += 1;
+    }
+    table
+};
 
 const fn default_all_break() -> Row {
     let mut row = [brk(State::Any); WordBreakProperty::NUM_VARIANTS];
@@ -308,4 +350,29 @@ const fn deferred(s: State) -> Transition {
 
 const fn transparent() -> Transition {
     Transition(State::Any, Action::Transparent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ASCII_WORD_TRANSITION, State, TABLE, Transition};
+    use crate::uax29::word::TokenProperties;
+    use crate::uax29::word::properties::ASCII_WORD_BREAK_PROP;
+
+    #[test]
+    fn ascii_word_transition_matches_table() {
+        for s in 0..State::NUM_VARIANTS {
+            for b in 0u8..128 {
+                let cell = ASCII_WORD_TRANSITION[s][b as usize];
+                let Transition(ns, a) = TABLE[s][ASCII_WORD_BREAK_PROP[b as usize] as usize];
+                assert_eq!(cell.next_state, ns, "next_state: state {s} byte {b:#04x}");
+                // Action is a fieldless `#[repr(u8)]` enum; compare by discriminant.
+                assert_eq!(cell.action as u8, a as u8, "action: state {s} byte {b:#04x}");
+                assert_eq!(
+                    cell.char_props,
+                    TokenProperties::from_ascii_byte(b),
+                    "char_props: state {s} byte {b:#04x}"
+                );
+            }
+        }
+    }
 }

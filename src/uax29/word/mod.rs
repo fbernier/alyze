@@ -4,10 +4,10 @@ pub(crate) mod transitions;
 use crate::uax29::Action;
 use crate::uax29::swar::{SWAR_HIGH, SWAR_ONES, WORD_BYTES, load_chunk, swar_in_range};
 use properties::{
-    ASCII_WORD_BREAK_PROP, WordBreakProperty, is_word_like_strict,
+    WordBreakProperty, is_word_like_strict,
     lookup_word_break_property_from_dictionary,
 };
-use transitions::{State, TABLE, Transition};
+use transitions::{ASCII_WORD_TRANSITION, State, TABLE, Transition};
 
 /// For backwards compatibility, require caller to pass in options struct.
 #[derive(Default, Clone, Copy, Debug)]
@@ -26,6 +26,30 @@ impl TokenProperties {
 
     pub(crate) const NON_ASCII: Self = Self(Self::NON_ASCII_MASK);
     pub(crate) const WORD_LIKE: Self = Self(Self::WORD_LIKE_MASK);
+    pub(crate) const EMPTY: Self = Self(0);
+
+    /// `TokenProperties` contribution of a single ASCII byte: `WORD_LIKE` for `[a-zA-Z0-9]`
+    /// (matching `is_ascii_alnum` — note `_` is *not* word-like), and the `ASCII_UPPERCASE`
+    /// bit for `[A-Z]`. The uppercase bit is set unconditionally; callers that don't want it
+    /// use `without_ascii_uppercase` (which `const`-folds away under the `ASCII_UPPERCASE` flag).
+    pub(crate) const fn from_ascii_byte(b: u8) -> Self {
+        let is_alpha = (b | 0x20).wrapping_sub(b'a') < 26;
+        let is_digit = b.wrapping_sub(b'0') < 10;
+        let mut bits = 0u8;
+        if is_alpha || is_digit {
+            bits |= Self::WORD_LIKE_MASK;
+        }
+        if b.wrapping_sub(b'A') < 26 {
+            bits |= Self::ASCII_UPPERCASE_MASK;
+        }
+        Self(bits)
+    }
+
+    /// Clears the ASCII-uppercase bit, leaving the rest. Used by the case-sensitive
+    /// monomorphization so the merged table's stored uppercase bit is dropped.
+    pub(crate) const fn without_ascii_uppercase(self) -> Self {
+        Self(self.0 & !Self::ASCII_UPPERCASE_MASK)
+    }
 
     // A token is "word-like" if it contains any char that is:
     // - ALetter, HebrewLetter, or Numeric (this is a fast-path from our DFA WordBreakProperty lookup)
@@ -148,48 +172,52 @@ fn tokenize_impl<const ASCII_UPPERCASE: bool>(
             }
         }
 
-        // Fast path for ASCII, e.g. avoid chars().next(), and lookup word property from table.
+        // Fast path for ASCII, e.g. avoid chars().next(); one merged-cell load resolves the DFA step.
         // `char_props` is this char's contribution to the enclosing token's properties; it's
         // applied to `token_props` per-arm below, since `Action::Break` treats the breaking char
         // as the first char of the *next* token (the contribution lands there, not in the token
         // being emitted).
         let b = bytes[pos];
-        let (c, prop, char_len, char_props) = if b < 0x80 {
-            (
-                b as char,
-                ASCII_WORD_BREAK_PROP[b as usize],
-                1usize,
-                // Same `[a-zA-Z0-9]` / `[A-Z]` classification the SWAR scan uses, so the
-                // single-char branch and the fast-lane run can't disagree on a byte's
-                // word-like / uppercase contribution.
-                {
-                    let mut p = if is_ascii_alnum(b) {
-                        TokenProperties::WORD_LIKE
-                    } else {
-                        TokenProperties(0)
-                    };
-                    if ASCII_UPPERCASE && b.is_ascii_uppercase() {
-                        p.0 |= TokenProperties::ASCII_UPPERCASE_MASK;
-                    }
-                    p
-                },
-            )
+        // Resolve this character's DFA step. `is_zwj` replaces the per-arm `prop == ZWJ` test so
+        // the ASCII branch needn't materialize `prop`; `c` stays available for the rare WB4
+        // ext-pictographic check after a ZWJ.
+        let next_state;
+        let action;
+        let char_props;
+        let char_len;
+        let c;
+        let is_zwj;
+        if b < 0x80 {
+            // One merged load instead of byte→prop then [state][prop]→transition, and the byte's
+            // `char_props` rides in the same cell (no per-char re-classification). No ASCII byte is
+            // ZWJ/Extend/Format, so ZWJ tracking is constant-false here (part B). The uppercase bit
+            // is `const`-stripped when the case-sensitive monomorphization didn't ask for it.
+            let cell = ASCII_WORD_TRANSITION[state as usize][b as usize];
+            next_state = cell.next_state;
+            action = cell.action;
+            char_props = if ASCII_UPPERCASE {
+                cell.char_props
+            } else {
+                cell.char_props.without_ascii_uppercase()
+            };
+            char_len = 1usize;
+            c = b as char;
+            is_zwj = false;
         } else {
-            let c = text[pos..].chars().next().unwrap();
+            c = text[pos..].chars().next().unwrap();
             let prop = lookup_word_break_property_from_dictionary(c);
-            // Cheap path covers ALetter / HebrewLetter / Numeric. For everything else, fall back
-            // to the strict per-char check (ExtPict / Ideographic / Script / OtherNumber).
-            let mut char_props = TokenProperties::NON_ASCII;
-            char_props |= WORD_BREAK_CONTRIB[prop as usize];
-            if !char_props.is_word_like() && is_word_like_strict(c) {
-                char_props |= TokenProperties::WORD_LIKE;
+            let mut cp = TokenProperties::NON_ASCII;
+            cp |= WORD_BREAK_CONTRIB[prop as usize];
+            if !cp.is_word_like() && is_word_like_strict(c) {
+                cp |= TokenProperties::WORD_LIKE;
             }
-            (c, prop, c.len_utf8(), char_props)
-        };
-
-        // Each iteration, we consult the transition table to determine the next state
-        // and whether to emit a breakpoint.
-        let Transition(next_state, action) = TABLE[state as usize][prop as usize];
+            char_props = cp;
+            let Transition(ns, a) = TABLE[state as usize][prop as usize];
+            next_state = ns;
+            action = a;
+            char_len = c.len_utf8();
+            is_zwj = matches!(prop, WordBreakProperty::ZWJ);
+        }
         match action {
             Action::Break => {
                 let boundary = pos;
@@ -202,7 +230,7 @@ fn tokenize_impl<const ASCII_UPPERCASE: bool>(
                         continue;
                     }
                 }
-                last_was_zwj = prop == WordBreakProperty::ZWJ;
+                last_was_zwj = is_zwj;
                 state = next_state;
                 if !on_breakpoint(boundary, std::mem::take(&mut token_props)) {
                     return;
@@ -242,7 +270,7 @@ fn tokenize_impl<const ASCII_UPPERCASE: bool>(
                 continue;
             }
             Action::Transparent => {
-                last_was_zwj = prop == WordBreakProperty::ZWJ;
+                last_was_zwj = is_zwj;
                 // State doesn't change, but we still consume the character.
                 pos += char_len;
                 if deferred_break_pos.is_some() {
@@ -741,5 +769,29 @@ mod tests {
                 (s.len(), true),                          // מהיום
             ],
         );
+    }
+
+    #[test]
+    fn from_ascii_byte_matches_inline_classification() {
+        use super::TokenProperties;
+        for b in 0u8..128 {
+            // Mirror the classification the per-char ASCII branch used to inline.
+            let is_alnum = (b | 0x20).wrapping_sub(b'a') < 26 || b.wrapping_sub(b'0') < 10;
+            let mut expected = if is_alnum {
+                TokenProperties::WORD_LIKE
+            } else {
+                TokenProperties(0)
+            };
+            if b.is_ascii_uppercase() {
+                expected |= TokenProperties(TokenProperties::ASCII_UPPERCASE_MASK);
+            }
+            assert_eq!(TokenProperties::from_ascii_byte(b), expected, "byte {b:#04x}");
+            assert_eq!(
+                TokenProperties::from_ascii_byte(b).without_ascii_uppercase(),
+                TokenProperties(expected.0 & !TokenProperties::ASCII_UPPERCASE_MASK),
+                "byte {b:#04x} without uppercase"
+            );
+        }
+        assert_eq!(TokenProperties::EMPTY, TokenProperties(0));
     }
 }
