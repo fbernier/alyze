@@ -25,6 +25,17 @@ jobs:
       # alyze + alyze-features; alyze-wasm targets wasm32 and isn't host-testable.
       - run: cargo test --workspace --exclude alyze-wasm
 
+  # The NEON backend is hand-written intrinsics that the x86 `test` job above never even compiles,
+  # let alone runs — and its differential tests are `cfg(target_arch = "aarch64")`, so they only
+  # exist here. A native arm64 runner (rather than cross-compiling) is what makes them execute.
+  test-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo test --workspace --exclude alyze-wasm
+
   # The word-continue scan is selected by `cfg`, so the host `test` job above exercises exactly one
   # of its backends. wasm32 is the portable-SWAR target and the only one where `WORD_BYTES` is 4
   # rather than 8 — every SWAR mask changes width with it — so keep it compiling at least.

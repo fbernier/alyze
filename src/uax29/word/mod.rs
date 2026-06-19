@@ -2,7 +2,9 @@ pub(crate) mod properties;
 pub(crate) mod transitions;
 
 use crate::uax29::Action;
-use crate::uax29::swar::{SWAR_HIGH, SWAR_ONES, WORD_BYTES, load_chunk, swar_in_range};
+use crate::uax29::swar::{
+    SWAR_HIGH, SWAR_ONES, WORD_BYTES, first_boundary_byte, load_chunk, swar_in_range,
+};
 use properties::{
     ASCII_WORD_BREAK_PROP, WordBreakProperty, is_word_like_strict,
     lookup_word_break_property_from_dictionary,
@@ -232,14 +234,92 @@ pub fn tokenize(
 /// the first byte that is *not* word-continue (or `bytes.len()`), whether the consumed run
 /// contained at least one alphanumeric char (i.e. is "word-like" — a run of only `_` is not), and
 /// whether it contained at least one ASCII uppercase byte (`[A-Z]`) — see
-/// [`TokenProperties::has_ascii_upper`].
+/// [`TokenProperties::has_ascii_upper`]. The uppercase flag is computed in the same pass that's
+/// already touching these bytes, so a case-folding consumer never needs a second per-token scan.
 ///
-/// This is the tokenizer's hottest loop on Latin-script text, so it classifies bytes with pure
-/// arithmetic (no per-byte table load: removes a load→load dependency that capped the original
-/// loop at ~1 cycle/byte) and processes a `usize` word at a time via SWAR. The uppercase flag rides
-/// along this same pass for free, so the caller never needs a second per-token scan.
+/// This is the tokenizer's hottest loop on Latin-script text. Dispatch is resolved entirely at
+/// compile time — no runtime feature detection — because every backend used here is part of its
+/// target's baseline ABI: NEON on `aarch64`, SSE2 on `x86_64`. Everything else (wasm32, 32-bit,
+/// exotic targets) falls back to the portable SWAR core. All three backends are differentially
+/// tested against the same scalar reference, so they are bit-identical by construction.
+///
+/// The two vector backends are deliberately *not* the same shape, because the tradeoff turns on one
+/// ISA difference: the cost of a movemask (vector→GPR transfer). On NEON that is the multi-cycle
+/// `shrn`+`umov` trick, so [`scan_word_continue_neon`] spends a cheap SWAR prefix to keep short words
+/// off the vector path entirely and defers its lane reductions to amortize the transfer. On x86 a
+/// `pmovmskb` is a single cheap uop, so [`scan_word_continue_sse2`] stays naive — both tricks were
+/// measured to *regress* it. Sharing is limited to what is genuinely identical: the SWAR
+/// classification kernel ([`swar_classify_word`]) and the scalar tail ([`scan_word_continue_tail`]).
 #[inline]
 fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool, bool) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is guaranteed on every `aarch64` target (it is part of the base ISA), so the
+    // intrinsics are always available without runtime detection.
+    return unsafe { scan_word_continue_neon(bytes, start) };
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is guaranteed on every `x86_64` target (it is part of the x86-64 baseline),
+    // so the intrinsics are always available without runtime detection.
+    return unsafe { scan_word_continue_sse2(bytes, start) };
+    // SWAR fallback: non-SIMD targets (wasm32, 32-bit, …).
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    return scan_word_continue_swar(bytes, start);
+}
+
+/// Classifies one SWAR word (`WORD_BYTES` bytes, already loaded as a little-endian `usize`) for the
+/// word-continue scan. Returns the per-lane `alnum` mask (alphanumeric lanes), the `upper` mask
+/// (`[A-Z]` lanes), and the `boundary` mask (the lane high bit is set in every non-continue lane).
+/// Shared by [`scan_word_continue_swar`] and the SWAR prefix of [`scan_word_continue_neon`] so the
+/// two cannot drift — a silent classification divergence would be a correctness bug, caught only by
+/// tests otherwise.
+// Only the SWAR core (dead on `aarch64`/`x86_64` outside tests/bench) and the aarch64 NEON prefix
+// call this, so mirror the core's dead-code allowance on the SIMD targets.
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+fn swar_classify_word(chunk: usize) -> (usize, usize, usize) {
+    // word-continue is alphanumeric plus `_`; `alnum` tracks the alphanumeric lanes, `upper` the
+    // `[A-Z]` lanes.
+    let is_alpha = swar_in_range(chunk | (SWAR_ONES * 0x20), b'a', b'z');
+    let alnum = is_alpha | swar_in_range(chunk, b'0', b'9');
+    // Uppercase = alpha lanes whose `0x20` case bit is clear. `is_alpha` already lives in the high
+    // bit of each lane; shifting the chunk left by 2 moves each lane's bit-5 (the `0x20` case bit)
+    // into that same high bit (5 + 2 = 7, stays within the lane), and `& !…` keeps the lanes where
+    // it was clear. Derived from `is_alpha` with no extra range test, so the uppercase signal rides
+    // along the load this scan already does.
+    let upper = is_alpha & !(chunk << 2) & SWAR_HIGH;
+    let cont = alnum | swar_in_range(chunk, b'_', b'_');
+    let boundary = (!cont) & SWAR_HIGH;
+    (alnum, upper, boundary)
+}
+
+/// Resolves a SWAR word-continue boundary hit (`boundary != 0`): folds `alnum`/`upper` into the
+/// accumulators, masked to the lanes before the boundary, and returns the final scan result. Shared
+/// by [`scan_word_continue_swar`] and the SWAR prefix in [`scan_word_continue_neon`] — the only two
+/// places that resolve this exact `(alnum, upper, boundary)` shape.
+#[inline(always)]
+fn resolve_swar_word_boundary(
+    pos: usize,
+    boundary: usize,
+    alnum: usize,
+    upper: usize,
+    mut word_like: bool,
+    mut has_upper: bool,
+) -> (usize, bool, bool) {
+    let off = first_boundary_byte(boundary);
+    let consumed_mask = boundary & boundary.wrapping_neg(); // lowest boundary high-bit
+    word_like |= (alnum & (consumed_mask - 1)) != 0;
+    has_upper |= (upper & (consumed_mask - 1)) != 0;
+    (pos + off, word_like, has_upper)
+}
+
+/// Portable SWAR (SIMD-within-a-register) core: classifies a `usize` word (8 bytes on 64-bit, 4 on
+/// wasm32) per iteration with pure integer arithmetic — no per-byte table load (removes a load→load
+/// dependency that capped the original loop at ~1 cycle/byte) and no architecture intrinsics. This
+/// is the universal fallback and stays exercised on every host via its own differential test.
+// On `aarch64`/`x86_64` the dispatcher never calls this (SIMD wins), so outside tests it is only
+// the fallback arm for other targets — silence dead-code there.
+#[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+#[inline]
+fn scan_word_continue_swar(bytes: &[u8], start: usize) -> (usize, bool, bool) {
     let mut pos = start;
     let mut word_like = false;
     let mut has_upper = false;
@@ -249,35 +329,231 @@ fn scan_word_continue(bytes: &[u8], start: usize) -> (usize, bool, bool) {
     while pos + WORD_BYTES <= bytes.len() {
         // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`.
         let chunk = unsafe { load_chunk(bytes, pos) };
-        // Computed once and reused: word-continue is alphanumeric plus `_`, `word_like` tracks the
-        // alphanumeric lanes, and `upper` the `[A-Z]` lanes.
-        let is_alpha = swar_in_range(chunk | (SWAR_ONES * 0x20), b'a', b'z');
-        let alnum = is_alpha | swar_in_range(chunk, b'0', b'9');
-        // Uppercase = alpha lanes whose `0x20` case bit is clear. `is_alpha` already lives in the
-        // high bit of each lane; shifting the chunk left by 2 moves each lane's bit-5 (the `0x20`
-        // case bit) into that same high bit (5 + 2 = 7, stays within the lane), and `& !…` keeps
-        // the lanes where it was clear. Derived from `is_alpha` with no extra range test, so the
-        // uppercase signal rides along the load this scan already does.
-        let upper = is_alpha & !(chunk << 2) & SWAR_HIGH;
-        let cont = alnum | swar_in_range(chunk, b'_', b'_');
-        let boundary = (!cont) & SWAR_HIGH;
+        let (alnum, upper, boundary) = swar_classify_word(chunk);
         if boundary == 0 {
             // All `WORD_BYTES` bytes continue the word.
             word_like |= alnum != 0;
             has_upper |= upper != 0;
             pos += WORD_BYTES;
         } else {
-            // First non-continue byte is at this offset within the chunk.
-            let off = (boundary.trailing_zeros() / 8) as usize;
-            // Only the lanes *before* the boundary are part of the run.
-            let consumed_mask = boundary & boundary.wrapping_neg(); // lowest boundary high-bit
-            word_like |= (alnum & (consumed_mask - 1)) != 0;
-            has_upper |= (upper & (consumed_mask - 1)) != 0;
+            return resolve_swar_word_boundary(pos, boundary, alnum, upper, word_like, has_upper);
+        }
+    }
+
+    // Scalar tail (and small inputs): finish one byte at a time — see `scan_word_continue_tail`.
+    scan_word_continue_tail(bytes, pos, word_like, has_upper)
+}
+
+/// Lane count of both SIMD backends. NEON (`uint8x16_t`) and SSE2 (`__m128i`) each process a
+/// 16-byte register per iteration.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const SIMD_LANES: usize = 16;
+
+/// Bytes a word-continue run must survive (boundary-free) in the cheap SWAR prefix before
+/// [`scan_word_continue_neon`] escalates to the wide vector loop. Any word up to this length resolves
+/// with no vector→GPR transfer, so all natural-language text stays on the SWAR-equivalent path and
+/// only long runs (URLs, identifiers, base64) reach the wide loop.
+///
+/// It only takes effect at `WORD_BYTES` (8-byte) granularity, so this is coarser than it looks:
+/// `16` means "two SWAR chunks" and every value in `9..=16` behaves identically. Worth re-sweeping
+/// if the deployment target's movemask cost differs much from the Apple Silicon it was measured on;
+/// setting it to `usize::MAX` makes the wide loop unreachable and reduces this backend to the
+/// portable SWAR scan, which is the safe fallback if a future core regresses on it.
+#[cfg(target_arch = "aarch64")]
+const NEON_SWAR_PREFIX: usize = 16;
+
+/// NEON backend. Classification mirrors [`scan_word_continue_swar`] lane-for-lane. Two structural
+/// differences exist purely to dodge NEON's expensive vector→GPR transfers (a movemask on NEON is
+/// the `shrn #4` trick plus a `umov`, multi-cycle and port-limited; that cost made a naive 16-byte
+/// loop lose to SWAR on short, natural-language words):
+///
+///  1. SWAR prefix: the scan is entered once per word, and most words are short, so their boundary
+///     lands inside the first 8-byte SWAR chunk, which resolves it with zero vector transfers. Only
+///     a run that stays boundary-free past [`NEON_SWAR_PREFIX`] bytes (a long URL / identifier /
+///     base64 blob, exactly where a 16-byte lane pays off) escalates to the wide loop.
+///  2. Deferred reductions: in the wide loop, `alnum`/`upper` are accumulated as vectors and reduced
+///     to scalars once on exit, so a steady-state chunk pays a single transfer (the boundary
+///     movemask, needed for the break position) instead of three.
+///
+/// # Safety
+/// Must be called on an `aarch64` target (NEON is baseline there, so no feature detection is
+/// needed). `bytes`/`start` carry no extra invariant; the loads are bounds-checked internally.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn)] // whole body is intrinsics; the fn's `# Safety` is the boundary
+unsafe fn scan_word_continue_neon(bytes: &[u8], start: usize) -> (usize, bool, bool) {
+    use core::arch::aarch64::*;
+
+    /// Packs a `0x00`/`0xFF`-per-lane mask into 4 bits per lane via the `shrn #4` trick, so lane
+    /// `i` lands at bit `4*i`. `trailing_zeros() / 4` is then the first set lane.
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn movemask4(v: uint8x16_t) -> u64 {
+        vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+            v,
+        ))))
+    }
+
+    const LANES: usize = SIMD_LANES;
+    let mut pos = start;
+    let mut word_like = false;
+    let mut has_upper = false;
+
+    // SWAR prefix (see this fn's doc). Uses the same per-chunk `swar_classify_word` as
+    // `scan_word_continue_swar`; the only difference is that, instead of running to completion, it
+    // hands off to the wide loop once a run survives `NEON_SWAR_PREFIX` bytes without a boundary.
+    while pos + WORD_BYTES <= bytes.len() && pos - start < NEON_SWAR_PREFIX {
+        // SAFETY: the `while` condition guarantees `pos + WORD_BYTES <= bytes.len()`.
+        let chunk = load_chunk(bytes, pos);
+        let (alnum, upper, boundary) = swar_classify_word(chunk);
+        if boundary != 0 {
+            return resolve_swar_word_boundary(pos, boundary, alnum, upper, word_like, has_upper);
+        }
+        word_like |= alnum != 0;
+        has_upper |= upper != 0;
+        pos += WORD_BYTES;
+    }
+
+    // Wide NEON loop with deferred reductions (see this fn's doc). Reached only for a long,
+    // still-open run. `alnum`/`upper` fold into vector accumulators; the only per-chunk transfer
+    // is the boundary movemask.
+    let mut alnum_acc = vdupq_n_u8(0);
+    let mut upper_acc = vdupq_n_u8(0);
+    while pos + LANES <= bytes.len() {
+        // SAFETY: the `while` condition guarantees `pos + LANES <= bytes.len()`; `vld1q_u8` is an
+        // unaligned load.
+        let chunk = vld1q_u8(bytes.as_ptr().add(pos));
+        // is_alpha: lowercase the lane (`| 0x20`) then test `a..=z`. A byte >= 0x80 can't enter
+        // `a..=z` after `| 0x20`, matching the SWAR core's `& !x` masking.
+        let lowered = vorrq_u8(chunk, vdupq_n_u8(0x20));
+        let is_alpha = vandq_u8(
+            vcgeq_u8(lowered, vdupq_n_u8(b'a')),
+            vcleq_u8(lowered, vdupq_n_u8(b'z')),
+        );
+        let is_digit = vandq_u8(
+            vcgeq_u8(chunk, vdupq_n_u8(b'0')),
+            vcleq_u8(chunk, vdupq_n_u8(b'9')),
+        );
+        let alnum = vorrq_u8(is_alpha, is_digit);
+        let cont = vorrq_u8(alnum, vceqq_u8(chunk, vdupq_n_u8(b'_')));
+        let boundary = vmvnq_u8(cont);
+        // upper = alpha lanes whose `0x20` case bit is clear (i.e. `[A-Z]`).
+        let case_clear = vceqq_u8(vandq_u8(chunk, vdupq_n_u8(0x20)), vdupq_n_u8(0));
+        let upper = vandq_u8(is_alpha, case_clear);
+
+        let bound_bits = movemask4(boundary);
+        if bound_bits == 0 {
+            alnum_acc = vorrq_u8(alnum_acc, alnum);
+            upper_acc = vorrq_u8(upper_acc, upper);
+            pos += LANES;
+        } else {
+            let off = (bound_bits.trailing_zeros() / 4) as usize;
+            // Keep only lanes *before* the boundary (`off` in `0..LANES`, so `off*4 < 64`). Fold the
+            // deferred accumulators (a horizontal max → nonzero iff any prior full chunk set a lane)
+            // together with this final partial chunk. The extra movemask(s) here are paid once per
+            // long run, not per chunk, so the steady-state single-transfer property holds.
+            let keep = (1u64 << (off * 4)) - 1;
+            word_like |= vmaxvq_u8(alnum_acc) != 0 || (movemask4(alnum) & keep) != 0;
+            has_upper |= vmaxvq_u8(upper_acc) != 0 || (movemask4(upper) & keep) != 0;
             return (pos + off, word_like, has_upper);
         }
     }
 
-    // Scalar tail (and small inputs): same classification, one byte at a time.
+    // Reduce the deferred accumulators once before the scalar tail picks up the remaining bytes.
+    word_like |= vmaxvq_u8(alnum_acc) != 0;
+    has_upper |= vmaxvq_u8(upper_acc) != 0;
+
+    // Scalar tail (and small inputs): finish one byte at a time — see `scan_word_continue_tail`.
+    scan_word_continue_tail(bytes, pos, word_like, has_upper)
+}
+
+/// SSE2 backend (16 bytes/iter). Same lane-for-lane classification as [`scan_word_continue_swar`].
+/// Unsigned byte range tests are built from saturating subtraction (SSE2 has only *signed* byte
+/// compares), and the per-lane reductions use `_mm_movemask_epi8` (1 bit/lane). Kept deliberately
+/// naive (no SWAR prefix, no deferred reductions) because `pmovmskb` is cheap on x86; see the
+/// movemask-cost discussion on [`scan_word_continue`] and the inline note below.
+///
+/// # Safety
+/// Must be called on an `x86_64` target (SSE2 is baseline there, so no feature detection is
+/// needed). `bytes`/`start` carry no extra invariant; the loads are bounds-checked internally.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(unsafe_op_in_unsafe_fn)] // whole body is intrinsics; the fn's `# Safety` is the boundary
+unsafe fn scan_word_continue_sse2(bytes: &[u8], start: usize) -> (usize, bool, bool) {
+    use core::arch::x86_64::*;
+
+    /// `lo <= b <= hi` (unsigned) per lane → `0xFF`/`0x00`, via saturating subtraction: a lane is
+    /// out of range iff `(lo - b)` or `(b - hi)` saturates above zero.
+    #[inline]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn in_range(b: __m128i, lo: u8, hi: u8) -> __m128i {
+        let below = _mm_subs_epu8(_mm_set1_epi8(lo as i8), b);
+        let above = _mm_subs_epu8(b, _mm_set1_epi8(hi as i8));
+        _mm_cmpeq_epi8(_mm_or_si128(below, above), _mm_setzero_si128())
+    }
+
+    const LANES: usize = SIMD_LANES;
+    let mut pos = start;
+    let mut word_like = false;
+    let mut has_upper = false;
+
+    // No deferred reductions / SWAR prefix here (unlike NEON): x86's `pmovmskb` is a cheap single
+    // uop, so a per-chunk movemask costs little and the naive form measured fastest end-to-end.
+    // Deferring the alnum/upper reductions was tried and *regressed* short words (~9% at len 5-12,
+    // ~1.5% end-to-end) while only helping >64-byte runs — the reduction's upside needs NEON's
+    // expensive vector→GPR transfer to pay off, which x86 doesn't have. See `scan_word_continue_neon`.
+    while pos + LANES <= bytes.len() {
+        // SAFETY: the `while` condition guarantees `pos + LANES <= bytes.len()`; `loadu` is an
+        // unaligned load.
+        let chunk = _mm_loadu_si128(bytes.as_ptr().add(pos) as *const __m128i);
+        // is_alpha: lowercase the lane (`| 0x20`) then test `a..=z`. A byte >= 0x80 can't enter
+        // `a..=z` after `| 0x20`, matching the SWAR core's `& !x` masking.
+        let lowered = _mm_or_si128(chunk, _mm_set1_epi8(0x20));
+        let is_alpha = in_range(lowered, b'a', b'z');
+        let is_digit = in_range(chunk, b'0', b'9');
+        let alnum = _mm_or_si128(is_alpha, is_digit);
+        let cont = _mm_or_si128(alnum, _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'_' as i8)));
+        // boundary = !cont
+        let boundary = _mm_andnot_si128(cont, _mm_set1_epi8(-1));
+
+        let bound_bits = _mm_movemask_epi8(boundary) as u32;
+        let alnum_bits = _mm_movemask_epi8(alnum) as u32;
+        // upper = alpha lanes whose `0x20` case bit is clear (i.e. `[A-Z]`).
+        let case_clear = _mm_cmpeq_epi8(
+            _mm_and_si128(chunk, _mm_set1_epi8(0x20)),
+            _mm_setzero_si128(),
+        );
+        let upper_bits = _mm_movemask_epi8(_mm_and_si128(is_alpha, case_clear)) as u32;
+
+        if bound_bits == 0 {
+            word_like |= alnum_bits != 0;
+            has_upper |= upper_bits != 0;
+            pos += LANES;
+        } else {
+            let off = bound_bits.trailing_zeros() as usize;
+            // Keep only lanes *before* the boundary (`off` in `0..LANES`).
+            let keep = (1u32 << off) - 1;
+            word_like |= (alnum_bits & keep) != 0;
+            has_upper |= (upper_bits & keep) != 0;
+            return (pos + off, word_like, has_upper);
+        }
+    }
+
+    // Scalar tail (and small inputs): finish one byte at a time — see `scan_word_continue_tail`.
+    scan_word_continue_tail(bytes, pos, word_like, has_upper)
+}
+
+/// Scalar tail shared by all three backends (SWAR / NEON / SSE2): finishes a word-continue run one
+/// byte at a time from `pos`, folding into the `word_like` / `has_upper` accumulators. Handles the
+/// bytes left over after the last full chunk and inputs shorter than one chunk. `#[inline(always)]`
+/// so each backend keeps identical codegen to the inlined loop it replaced.
+#[inline(always)]
+fn scan_word_continue_tail(
+    bytes: &[u8],
+    mut pos: usize,
+    mut word_like: bool,
+    mut has_upper: bool,
+) -> (usize, bool, bool) {
     while pos < bytes.len() {
         let b = bytes[pos];
         let is_alnum = is_ascii_alnum(b);
@@ -435,17 +711,19 @@ mod tests {
         (pos, word_like, has_upper)
     }
 
-    #[test]
-    fn scan_word_continue_matches_reference() {
+    /// Runs the full differential battery (exhaustive single-byte-at-every-offset + 200k randomized
+    /// inputs) against the trivial scalar reference. `scan` is the implementation under test; it
+    /// must agree with `scan_reference` on every `(end, word_like, has_upper)` triple.
+    fn assert_scan_matches_reference(scan: impl Fn(&[u8], usize) -> (usize, bool, bool)) {
         // Exhaustive: every single byte value, at every alignment offset within a chunk, with a
-        // word-continue prefix so the SWAR lane that contains the byte varies.
+        // word-continue prefix so the SWAR/SIMD lane that contains the byte varies.
         for prefix in 0..=16usize {
             for b in 0..=255u8 {
                 let mut buf = vec![b'a'; prefix];
                 buf.push(b);
                 buf.extend_from_slice(b"z9_more");
                 assert_eq!(
-                    scan_word_continue(&buf, 0),
+                    scan(&buf, 0),
                     scan_reference(&buf, 0),
                     "prefix={prefix} byte={b:#04x}"
                 );
@@ -480,11 +758,33 @@ mod tests {
                 (rng() as usize) % (len + 1)
             };
             assert_eq!(
-                scan_word_continue(&buf, start),
+                scan(&buf, start),
                 scan_reference(&buf, start),
                 "buf={buf:?} start={start}"
             );
         }
+    }
+
+    #[test]
+    fn scan_word_continue_matches_reference() {
+        // The dispatcher (whichever backend the host selects) and the portable SWAR core must both
+        // match the reference.
+        assert_scan_matches_reference(scan_word_continue);
+        assert_scan_matches_reference(super::scan_word_continue_swar);
+    }
+
+    /// The NEON backend must be bit-identical to the scalar reference (and therefore to SWAR).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn scan_word_continue_neon_matches_reference() {
+        assert_scan_matches_reference(|b, s| unsafe { super::scan_word_continue_neon(b, s) });
+    }
+
+    /// The SSE2 backend must be bit-identical to the scalar reference (and therefore to SWAR).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn scan_word_continue_sse2_matches_reference() {
+        assert_scan_matches_reference(|b, s| unsafe { super::scan_word_continue_sse2(b, s) });
     }
 
     #[test]
