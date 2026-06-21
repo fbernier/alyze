@@ -155,19 +155,53 @@ fn tokenize_impl<const ASCII_UPPERCASE: bool>(
             let (end, word_like, has_upper) = scan_word_continue::<ASCII_UPPERCASE>(bytes, pos);
             pos = end;
             if pos > scan_start {
-                if word_like {
-                    token_props.0 |= TokenProperties::WORD_LIKE_MASK;
-                }
-                if ASCII_UPPERCASE && has_upper {
-                    token_props.0 |= TokenProperties::ASCII_UPPERCASE_MASK;
-                }
-                let last = bytes[pos - 1]; // Safe because we're not in State::StartOfText.
-                state = match last {
-                    b'0'..=b'9' => State::Numeric,
-                    b'_' => State::ExtendNumLet,
-                    _ => State::ALetter,
-                };
+                // `bytes[pos - 1]` is in bounds: `pos > scan_start`, so `pos >= 1`.
+                state = fold_ascii_word::<ASCII_UPPERCASE>(
+                    &mut token_props,
+                    word_like,
+                    has_upper,
+                    bytes[pos - 1],
+                );
                 last_was_zwj = false;
+
+                // Fused fast-path for the dominant `word · spaces · word` alternation. A word
+                // followed by a run of plain spaces (U+0020) is an *unconditional* break pair under
+                // UAX#29 — `word ÷ WSegSpace` and `WSegSpace ÷ next` — with the whole run a single
+                // WSegSpace segment (WB3d). Emitting both breaks inline and rolling straight into the
+                // next word keeps that alternation out of the per-char DFA, whose cell-load +
+                // indirect jump is the bulk of non-scan word-break time (profiled). Only U+0020
+                // qualifies (tab/newline/NBSP break differently); and only when a fast-scannable word
+                // follows the spaces — otherwise leave `pos`/`state` untouched and let the DFA emit
+                // the WSegSpace break, since its post-break state depends on the following char.
+                while pos < text.len() && bytes[pos] == b' ' {
+                    let word_end = pos;
+                    let mut after = pos;
+                    while after < text.len() && bytes[after] == b' ' {
+                        after += 1;
+                    }
+                    if after >= text.len() || !is_ascii_word_start(bytes[after]) {
+                        break; // DFA handles the space run and its terminator
+                    }
+                    // Word token ends at the first space.
+                    if !on_breakpoint(word_end, std::mem::take(&mut token_props)) {
+                        return;
+                    }
+                    // Space-run token ends at the next word start; its props are empty (ASCII, not
+                    // word-like), so the take leaves `token_props` cleared for the next word.
+                    pos = after;
+                    if !on_breakpoint(pos, std::mem::take(&mut token_props)) {
+                        return;
+                    }
+                    // Scan the next word inline (non-empty: `bytes[pos]` is a word-start byte).
+                    let (e, wl, hu) = scan_word_continue::<ASCII_UPPERCASE>(bytes, pos);
+                    pos = e;
+                    state = fold_ascii_word::<ASCII_UPPERCASE>(
+                        &mut token_props,
+                        wl,
+                        hu,
+                        bytes[pos - 1],
+                    );
+                }
                 continue;
             }
         }
@@ -306,19 +340,28 @@ fn tokenize_impl<const ASCII_UPPERCASE: bool>(
 /// without a second per-token scan — see [`TokenProperties::has_ascii_uppercase`]. When `false`,
 /// all of that work is `const`-eliminated and `has_upper` is always `false`.
 ///
-/// This is the tokenizer's hottest loop on Latin-script text. Dispatch is resolved entirely at
-/// compile time — no runtime feature detection — because every backend used here is part of its
-/// target's baseline ABI: NEON on `aarch64`, SSE2 on `x86_64`. Everything else (wasm32, 32-bit,
-/// exotic targets) falls back to the portable SWAR core. All three backends are differentially
-/// tested against the same scalar reference, so they are bit-identical by construction.
+/// This is the tokenizer's hottest loop on Latin-script text. The backend is chosen entirely at
+/// compile time via `cfg`, never at runtime: a runtime `target_feature` boundary can't inline into
+/// this loop and measured a net regression even where the wider kernel is faster.
 ///
-/// The two vector backends are deliberately *not* the same shape, because the tradeoff turns on one
-/// ISA difference: the cost of a movemask (vector→GPR transfer). On NEON that is the multi-cycle
-/// `shrn`+`umov` trick, so [`scan_word_continue_neon`] spends a cheap SWAR prefix to keep short words
-/// off the vector path entirely and defers its lane reductions to amortize the transfer. On x86 a
-/// `pmovmskb` is a single cheap uop, so [`scan_word_continue_sse2`] stays naive — both tricks were
-/// measured to *regress* it. Sharing is limited to what is genuinely identical: the SWAR
-/// classification kernel ([`swar_classify_word`]) and the scalar tail ([`scan_word_continue_tail`]).
+/// - `aarch64`          → [`scan_word_continue_neon`] (NEON is baseline there)
+/// - `x86_64` + `ssse3` → [`scan_word_continue_sse2_pshufb`] (PSHUFB nibble-table classifier;
+///   opt in with `-C target-cpu=x86-64-v2` / `+ssse3`)
+/// - `x86_64`           → [`scan_word_continue_sse2`] (SSE2 is the x86-64 baseline)
+/// - everything else    → [`scan_word_continue_swar`] (portable: wasm32, 32-bit, exotic targets)
+///
+/// Every backend is differentially tested against the same byte-at-a-time scalar reference, so they
+/// are bit-identical by construction.
+///
+/// They are deliberately *not* one shape, because the tradeoff turns on the cost of a movemask
+/// (vector→GPR transfer). On NEON that is the multi-cycle `shrn`+`umov` trick, so
+/// [`scan_word_continue_neon`] spends a cheap SWAR prefix to keep short words off the vector path and
+/// defers its lane reductions to amortize the transfer. On x86 a `pmovmskb` is a single cheap uop, so
+/// the SSE2 and PSHUFB backends stay naive (both tricks were measured to *regress* them) and differ
+/// only in the classifier — saturating-subtraction range tests vs. a PSHUFB nibble-table lookup.
+/// Sharing is limited to what is genuinely identical: the SWAR classification kernel
+/// ([`swar_classify_word`], reused by the NEON prefix) and the scalar tail
+/// ([`scan_word_continue_tail`], reused by all four).
 #[inline]
 fn scan_word_continue<const ASCII_UPPERCASE: bool>(
     bytes: &[u8],
@@ -328,7 +371,12 @@ fn scan_word_continue<const ASCII_UPPERCASE: bool>(
     // SAFETY: NEON is guaranteed on every `aarch64` target (it is part of the base ISA), so the
     // intrinsics are always available without runtime detection.
     return unsafe { scan_word_continue_neon::<ASCII_UPPERCASE>(bytes, start) };
-    #[cfg(target_arch = "x86_64")]
+    // On x86_64, PSHUFB when the build opts into SSSE3, else the baseline SSE2 (see this fn's doc
+    // for the per-arm rationale and why the choice is compile-time, not runtime).
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    // SAFETY: this arm is compiled only when SSSE3 is in the target feature set, so PSHUFB is available.
+    return unsafe { scan_word_continue_sse2_pshufb::<ASCII_UPPERCASE>(bytes, start) };
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "ssse3")))]
     // SAFETY: SSE2 is guaranteed on every `x86_64` target (it is part of the x86-64 baseline),
     // so the intrinsics are always available without runtime detection.
     return unsafe { scan_word_continue_sse2::<ASCII_UPPERCASE>(bytes, start) };
@@ -413,8 +461,8 @@ fn scan_word_continue_swar<const ASCII_UPPERCASE: bool>(
     scan_word_continue_tail::<ASCII_UPPERCASE>(bytes, pos, word_like, has_upper)
 }
 
-/// Lane count of both SIMD backends. NEON (`uint8x16_t`) and SSE2 (`__m128i`) each process a
-/// 16-byte register per iteration.
+/// Lane count of the vector backends. NEON (`uint8x16_t`) and SSE2/PSHUFB (`__m128i`) each process
+/// a 16-byte register per iteration.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const SIMD_LANES: usize = 16;
 
@@ -562,6 +610,9 @@ unsafe fn scan_word_continue_neon<const ASCII_UPPERCASE: bool>(
 /// Must be called on an `x86_64` target (SSE2 is baseline there, so no feature detection is
 /// needed). `bytes`/`start` carry no extra invariant; the loads are bounds-checked internally.
 #[cfg(target_arch = "x86_64")]
+// In an SSSE3 build the dispatcher takes the PSHUFB arm, so this is reached only by its own
+// differential test there — allow it to be unused outside tests.
+#[cfg_attr(target_feature = "ssse3", allow(dead_code))]
 #[inline]
 #[allow(unsafe_op_in_unsafe_fn)] // whole body is intrinsics; the fn's `# Safety` is the boundary
 unsafe fn scan_word_continue_sse2<const ASCII_UPPERCASE: bool>(
@@ -633,10 +684,103 @@ unsafe fn scan_word_continue_sse2<const ASCII_UPPERCASE: bool>(
     scan_word_continue_tail::<ASCII_UPPERCASE>(bytes, pos, word_like, has_upper)
 }
 
-/// Scalar tail shared by all three backends (SWAR / NEON / SSE2): finishes a word-continue run one
-/// byte at a time from `pos`, folding into the `word_like` / `has_upper` accumulators. Handles the
-/// bytes left over after the last full chunk and inputs shorter than one chunk. `#[inline(always)]`
-/// so each backend keeps identical codegen to the inlined loop it replaced.
+/// SSSE3 backend: same 16-byte loop as [`scan_word_continue_sse2`], but classification is a PSHUFB
+/// nibble-table lookup instead of saturating-subtraction range tests, which measured ~8-12% faster
+/// end-to-end (the property masks fall out of the same lookup, so `word_like`/`has_upper` are nearly
+/// free). A byte is word-continue iff `lut_lo[lo] & lut_hi[hi] != 0`, with one bit per
+/// (hi,lo)-rectangle class:
+///   bit0: `A-O`/`a-o`  (hi in {4,6}, lo in 1..=15)
+///   bit1: `P-Z`/`p-z`  (hi in {5,7}, lo in 0..=10)
+///   bit2: `0-9`        (hi == 3,     lo in 0..=9)
+///   bit3: `_`          (hi == 5,     lo == 15)
+/// So `alnum` = bits{0,1,2}, `alpha` = bits{0,1}, and `upper` = alpha lanes with the `0x20` case bit
+/// clear. Boundary detection / reductions are identical to the SSE2 backend (cheap `pmovmskb`).
+///
+/// PSHUFB is SSSE3, *not* part of the SSE2 baseline, so the dispatcher selects this arm only under
+/// `cfg(target_feature = "ssse3")` (a `-C target-cpu=x86-64-v2` / `+ssse3` build). The
+/// `target_feature` attribute additionally keeps the body compilable in a baseline build, where only
+/// the differential test reaches it behind a runtime SSSE3 probe.
+///
+/// # Safety
+/// Must run on a CPU with SSSE3. `bytes`/`start` carry no extra invariant; loads are bounds-checked.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+#[allow(unsafe_op_in_unsafe_fn)]
+// In a baseline build the dispatcher takes the SSE2 arm, so this is reached only by its own
+// differential test there — allow it to be unused outside tests.
+#[cfg_attr(not(target_feature = "ssse3"), allow(dead_code))]
+unsafe fn scan_word_continue_sse2_pshufb<const ASCII_UPPERCASE: bool>(
+    bytes: &[u8],
+    start: usize,
+) -> (usize, bool, bool) {
+    use core::arch::x86_64::*;
+
+    const LANES: usize = SIMD_LANES;
+    let mut pos = start;
+    let mut word_like = false;
+    let mut has_upper = false;
+
+    // Low-nibble table: bit set per class the low nibble *permits* (see fn doc for the bit layout).
+    let lut_lo = _mm_setr_epi8(
+        0x06, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, // lo 0..=7
+        0x07, 0x07, 0x03, 0x01, 0x01, 0x01, 0x01, 0x09, // lo 8..=15
+    );
+    // High-nibble table: bit set per class the high nibble permits. Rows 8..=15 (non-ASCII) are 0,
+    // so any byte >= 0x80 yields `m == 0` → boundary, matching the SSE2 backend's `& !x` masking.
+    let lut_hi = _mm_setr_epi8(
+        0x00, 0x00, 0x00, 0x04, 0x01, 0x0A, 0x01, 0x02, // hi 0..=7
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // hi 8..=15
+    );
+    let nib_mask = _mm_set1_epi8(0x0F);
+    let zero = _mm_setzero_si128();
+
+    while pos + LANES <= bytes.len() {
+        // SAFETY: the `while` condition guarantees `pos + LANES <= bytes.len()`; `loadu` is unaligned.
+        let chunk = _mm_loadu_si128(bytes.as_ptr().add(pos) as *const __m128i);
+        let lo_nib = _mm_and_si128(chunk, nib_mask);
+        // No byte shuffle in SSSE3, so shift as 16-bit lanes then mask off the bits dragged in from
+        // the neighbouring byte. PSHUFB indices stay in 0..=15 (high bit clear), so no lane is zeroed.
+        let hi_nib = _mm_and_si128(_mm_srli_epi16(chunk, 4), nib_mask);
+        let m = _mm_and_si128(
+            _mm_shuffle_epi8(lut_lo, lo_nib),
+            _mm_shuffle_epi8(lut_hi, hi_nib),
+        );
+
+        // boundary lanes: `m == 0`.
+        let bound_bits = _mm_movemask_epi8(_mm_cmpeq_epi8(m, zero)) as u32;
+        // alnum lanes: `(m & 0b0111) != 0` — invert the is-zero mask.
+        let alnum_zero = _mm_cmpeq_epi8(_mm_and_si128(m, _mm_set1_epi8(0x07)), zero);
+        let alnum_bits = (!(_mm_movemask_epi8(alnum_zero) as u32)) & 0xFFFF;
+        let upper_bits = if ASCII_UPPERCASE {
+            // alpha lanes: `(m & 0b0011) != 0`; case-clear lanes: `(byte & 0x20) == 0`.
+            let alpha_zero = _mm_cmpeq_epi8(_mm_and_si128(m, _mm_set1_epi8(0x03)), zero);
+            let case_clear = _mm_cmpeq_epi8(_mm_and_si128(chunk, _mm_set1_epi8(0x20)), zero);
+            // upper = !alpha_zero & case_clear
+            _mm_movemask_epi8(_mm_andnot_si128(alpha_zero, case_clear)) as u32
+        } else {
+            0
+        };
+
+        if bound_bits == 0 {
+            word_like |= alnum_bits != 0;
+            has_upper |= ASCII_UPPERCASE && upper_bits != 0;
+            pos += LANES;
+        } else {
+            let off = bound_bits.trailing_zeros() as usize;
+            let keep = (1u32 << off) - 1;
+            word_like |= (alnum_bits & keep) != 0;
+            has_upper |= ASCII_UPPERCASE && (upper_bits & keep) != 0;
+            return (pos + off, word_like, has_upper);
+        }
+    }
+
+    scan_word_continue_tail::<ASCII_UPPERCASE>(bytes, pos, word_like, has_upper)
+}
+
+/// Scalar tail shared by all four backends (SWAR / NEON / SSE2 / PSHUFB): finishes a word-continue
+/// run one byte at a time from `pos`, folding into the `word_like` / `has_upper` accumulators.
+/// Handles the bytes left over after the last full chunk and inputs shorter than one chunk.
+/// `#[inline(always)]` so each backend keeps identical codegen to the inlined loop it replaced.
 #[inline(always)]
 fn scan_word_continue_tail<const ASCII_UPPERCASE: bool>(
     bytes: &[u8],
@@ -665,6 +809,39 @@ fn is_ascii_alnum(b: u8) -> bool {
     let is_alpha = (b | 0x20).wrapping_sub(b'a') < 26;
     let is_digit = b.wrapping_sub(b'0') < 10;
     is_alpha | is_digit
+}
+
+/// First-byte test for the word-continue run `[a-zA-Z0-9_]`. Used by the fused word·space fast-path
+/// to decide whether the byte after a space run starts a word it can scan inline.
+#[inline(always)]
+fn is_ascii_word_start(b: u8) -> bool {
+    is_ascii_alnum(b) | (b == b'_')
+}
+
+/// Folds a freshly-scanned ASCII word run into the in-progress token: ORs its word-like / uppercase
+/// contribution into `token_props`, and returns the DFA state the run's last byte lands in
+/// (`b'0'..=b'9'` → Numeric, `b'_'` → ExtendNumLet, else ALetter). Shared by the two ASCII
+/// fast-paths — the scan-once entry and the fused word·space loop — so they can't disagree on a
+/// run's contribution. `#[inline(always)]`: it's in the tokenizer's hottest loop, and an out-of-line
+/// call here would break the surrounding inlining (the crate has hit that cliff before).
+#[inline(always)]
+fn fold_ascii_word<const ASCII_UPPERCASE: bool>(
+    token_props: &mut TokenProperties,
+    word_like: bool,
+    has_upper: bool,
+    last_byte: u8,
+) -> State {
+    if word_like {
+        token_props.0 |= TokenProperties::WORD_LIKE_MASK;
+    }
+    if ASCII_UPPERCASE && has_upper {
+        token_props.0 |= TokenProperties::ASCII_UPPERCASE_MASK;
+    }
+    match last_byte {
+        b'0'..=b'9' => State::Numeric,
+        b'_' => State::ExtendNumLet,
+        _ => State::ALetter,
+    }
 }
 
 /// Cheap-path `TokenProperties` contribution for each `WordBreakProperty` value. Covers the
@@ -789,6 +966,86 @@ mod tests {
         assert_scan_matches_reference(|b, s| unsafe {
             super::scan_word_continue_sse2::<true>(b, s)
         });
+    }
+
+    /// The PSHUFB backend must be bit-identical to the reference too. Skipped at runtime on CPUs
+    /// without SSSE3 (the intrinsics would be UB there).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn scan_word_continue_sse2_pshufb_matches_reference() {
+        if !std::is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        assert_scan_matches_reference(|b, s| unsafe {
+            super::scan_word_continue_sse2_pshufb::<true>(b, s)
+        });
+    }
+
+    /// Locks in the fused `word · spaces · word` fast-path against the same boundaries the
+    /// per-char DFA produces. These cases all flow through the inline space handling (plain U+0020
+    /// runs between fast-scannable words); the DFA must still own everything it bails on.
+    #[test]
+    fn fused_word_space_fast_path() {
+        fn assert_breaks(s: &str, expected: Vec<usize>) {
+            let mut breakpoints = Vec::new();
+            tokenize(s, Options::default(), |bp, _props| {
+                breakpoints.push(bp);
+                true
+            });
+            assert_eq!(breakpoints, expected, "input: {s:?}");
+        }
+
+        // Single spaces between words: each word and each space run is its own segment.
+        assert_breaks("a b c", vec![0, 1, 2, 3, 4, 5]);
+        assert_breaks("ab cd ef", vec![0, 2, 3, 5, 6, 8]);
+        // Multi-space run stays one segment (WB3d), then the fused path rolls into the next word.
+        assert_breaks("ab   cd", vec![0, 2, 5, 7]);
+        // Trailing space run is emitted by the WB2 tail, not double-emitted by the fused loop.
+        assert_breaks("ab ", vec![0, 2, 3]);
+        assert_breaks("ab   ", vec![0, 2, 5]);
+        // Next word starts with a digit / underscore: state + word-likeness come from the scan.
+        assert_breaks("ab 12", vec![0, 2, 3, 5]);
+        assert_breaks("ab _c", vec![0, 2, 3, 5]);
+        // Leading spaces are handled by the DFA (not the fused entry), and must still be correct.
+        assert_breaks("  ab", vec![0, 2, 4]);
+        // A non-space terminator must fall back to the DFA: tab is not WSegSpace, and the word may
+        // join following punctuation (won't / e.g.) rather than break.
+        assert_breaks("a\tb", vec![0, 1, 2, 3]);
+        assert_breaks("ab c.d", vec![0, 2, 3, 6]);
+    }
+
+    /// The fused fast-path hardcodes three UAX#29 facts as inline logic. Assert them against the
+    /// canonical transition table (the single source of truth), mirroring the table's own
+    /// `ascii_word_transition_matches_table` discipline, so a future table edit can't silently
+    /// desync the fast-path from the DFA it's meant to shortcut.
+    #[test]
+    fn fused_fast_path_assumptions_hold_in_table() {
+        use super::TokenProperties;
+        use super::transitions::{ASCII_WORD_TRANSITION, State};
+        use crate::uax29::Action;
+
+        // (1) From every word state the fused entry runs in, a space unconditionally breaks
+        //     (`word ÷ WSegSpace`) and lands in WSegSpace — and the space token carries no props.
+        for s in [
+            State::ALetter,
+            State::Numeric,
+            State::ExtendNumLet,
+            State::HLetter,
+        ] {
+            let cell = ASCII_WORD_TRANSITION[s as usize][b' ' as usize];
+            assert!(matches!(cell.action, Action::Break), "{s:?} ÷ space must Break");
+            assert_eq!(cell.next_state, State::WSegSpace, "space lands in WSegSpace from {s:?}");
+            assert_eq!(cell.char_props, TokenProperties(0), "space carries no props");
+        }
+        // (2) A space run is a single segment: WSegSpace × WSegSpace stays, no break (WB3d).
+        let run = ASCII_WORD_TRANSITION[State::WSegSpace as usize][b' ' as usize];
+        assert!(matches!(run.action, Action::NoBreak), "space × space must not break (WB3d)");
+        assert_eq!(run.next_state, State::WSegSpace);
+        // (3) The space run breaks before whatever word-start byte follows (`WSegSpace ÷ next`).
+        for b in [b'a', b'Z', b'0', b'_'] {
+            let cell = ASCII_WORD_TRANSITION[State::WSegSpace as usize][b as usize];
+            assert!(matches!(cell.action, Action::Break), "WSegSpace ÷ {:?} must Break", b as char);
+        }
     }
 
     #[test]
