@@ -75,6 +75,7 @@ name = "alyze-features"
 version = "0.1.0"
 dependencies = [
  "alyze",
+ "criterion",
 ]
 
 [[package]]

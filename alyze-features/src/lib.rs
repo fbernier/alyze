@@ -19,15 +19,24 @@ pub struct Analyzed {
 }
 
 impl Analyzed {
-    /// Analyzes the given text and returns an `Analyzed` struct containing the tokens and their positions.
-    /// Used for computing features on query and document fields.
+    /// Tokenizes `text` into a term→positions index for feature computation.
+    ///
+    /// The feature code indexes the field by position, so positions must be **contiguous**
+    /// (`0,1,2,…`) — pass a no-stopword, no-length-filter analyzer.
+    ///
+    /// # Panics
+    /// If positions are gapped (stopword removal / length filtering), which would otherwise silently
+    /// misscore.
     pub fn from_text(analyzer: &Analyzer, buffer: &mut ReusableBuffer, text: &str) -> Self {
         let mut tokens = BTreeMap::<String, Vec<usize>>::new();
+        let mut expected = 0;
         analyzer.analyze(text, buffer, |t| {
-            tokens
-                .entry(t.text.to_string())
-                .or_default()
-                .push(t.position);
+            assert_eq!(
+                t.position, expected,
+                "alyze-features needs contiguous token positions (no stopword removal / length filter)"
+            );
+            expected += 1;
+            tokens.entry(t.text.to_string()).or_default().push(t.position);
             true
         });
         Self { tokens }
@@ -36,6 +45,11 @@ impl Analyzed {
     /// Total number of tokens, counting repeats (the element length).
     fn total_num_tokens(&self) -> usize {
         self.tokens.values().map(Vec::len).sum()
+    }
+
+    /// Ascending positions of `term` in this text, or empty if absent.
+    fn positions_of(&self, term: &str) -> &[usize] {
+        self.tokens.get(term).map_or(&[], Vec::as_slice)
     }
 
     /// The token occupying the given position, if any. Used to resolve a query term by its index
@@ -49,8 +63,8 @@ impl Analyzed {
     }
 
     /// The tokens as an ordered sequence (by position), with repeats — the field/query token list
-    /// the match features are computed over. Assumes contiguous positions (no gaps), which holds
-    /// for the analysis config used here (no stopword removal).
+    /// the match features are computed over. Positions are contiguous (guaranteed by `from_text`),
+    /// so this is just the tokens in position order.
     fn ordered_tokens(&self) -> Vec<&str> {
         let mut by_position: Vec<(usize, &str)> = self
             .tokens
@@ -481,7 +495,6 @@ pub fn field_match(
     stats: impl Fn(&str) -> TermStats,
 ) -> FieldMatch {
     let query_terms = query.ordered_tokens();
-    let field_terms = document.ordered_tokens();
     let mut weights = Vec::with_capacity(query_terms.len());
     let mut significances = Vec::with_capacity(query_terms.len());
     for &term in &query_terms {
@@ -489,13 +502,26 @@ pub fn field_match(
         weights.push(s.weight);
         significances.push(s.significance());
     }
-    field_match::compute(&query_terms, &field_terms, &weights, &significances)
+    // Index the field by position directly — positions are contiguous `0..field_len` (guaranteed by
+    // `Analyzed::from_text`), so a query term's positions are its field indices.
+    let field_positions: Vec<&[usize]> = query_terms
+        .iter()
+        .map(|&t| document.positions_of(t))
+        .collect();
+    let field_len = document.total_num_tokens() as i32;
+    field_match::compute(
+        &query_terms,
+        field_positions,
+        field_len,
+        &weights,
+        &significances,
+    )
 }
 
 /// The `fieldMatch` string-match metric computer: it finds the best segmentation of the matched
 /// query terms in the field and derives the metric outputs from it.
 mod field_match {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use super::FieldMatch;
 
@@ -558,6 +584,33 @@ mod field_match {
         } else {
             (zero_j - j - 1) + field_len - zero_j
         }
+    }
+
+    /// Smallest semantic distance `>= start` at which a query term occurs in the field (else `-1`),
+    /// given its sorted field `positions`. Same result as the old `start..field_len` field scan.
+    /// `previous_j >= 0`: invert each occurrence (the index↔distance mapping is a bijection there).
+    /// `previous_j == -1` (segment start): that inverse is degenerate, so scan exactly.
+    ///
+    /// O(occurrences): a big win when query terms are sparse (the common case); slower than the old
+    /// early-returning scan only when a term recurs very densely.
+    fn closest_match(positions: &[usize], previous_j: i32, start: i32, field_len: i32) -> i32 {
+        if previous_j < 0 {
+            for distance in start..field_len {
+                let j = semantic_distance_to_field_index(distance, previous_j, field_len);
+                if j >= 0 && positions.binary_search(&(j as usize)).is_ok() {
+                    return distance;
+                }
+            }
+            return -1;
+        }
+        let mut best = -1;
+        for &j in positions {
+            let d = field_index_to_semantic_distance(j as i32, previous_j, field_len);
+            if d >= start && (best == -1 || d < best) {
+                best = d;
+            }
+        }
+        best
     }
 
     /// Accumulated match metrics for one segmentation. Cloned as alternative segmentations are explored.
@@ -880,9 +933,12 @@ mod field_match {
 
     struct Computer<'a> {
         query: &'a [&'a str],
-        field: &'a [&'a str],
+        field_len: i32,
         weights: &'a [i32],
         significances: &'a [f64],
+        /// Each query term's field positions (ascending), by query position; borrowed from the
+        /// document index so the search iterates occurrences instead of rescanning the field.
+        field_positions: Vec<&'a [usize]>,
         metrics: Metrics,
         segment_start_points: Vec<Option<SegmentStartPoint>>,
         alternative_segmentations_tried: i32,
@@ -890,7 +946,7 @@ mod field_match {
 
     impl<'a> Computer<'a> {
         fn field_len(&self) -> i32 {
-            self.field.len() as i32
+            self.field_len
         }
 
         fn find_closest_in_field_by_semantic_distance(
@@ -899,15 +955,12 @@ mod field_match {
             previous_j: i32,
             start_semantic_distance: i32,
         ) -> i32 {
-            let term = self.query[i as usize];
-            let field_len = self.field_len();
-            for distance in start_semantic_distance..field_len {
-                let j = semantic_distance_to_field_index(distance, previous_j, field_len);
-                if j >= 0 && term == self.field[j as usize] {
-                    return distance;
-                }
-            }
-            -1
+            closest_match(
+                self.field_positions[i as usize],
+                previous_j,
+                start_semantic_distance,
+                self.field_len,
+            )
         }
 
         fn segment_start(&mut self, j: i32, previous_j: i32) {
@@ -1071,24 +1124,29 @@ mod field_match {
     /// both the `divider` and the `absoluteOccurrence` denominator.
     fn occurrence_counts(
         query: &[&str],
-        field: &[&str],
+        field_positions: &[&[usize]],
+        field_len: i32,
         term_stats: &BTreeMap<&str, (i32, f64)>,
         metrics: &mut Metrics,
     ) {
-        let unique: BTreeSet<&str> = query
-            .iter()
-            .copied()
-            .filter(|t| field.contains(t))
-            .collect();
-        if unique.is_empty() {
+        // Distinct query terms present in the field, each with its `MAX_OCCURRENCES`-capped count,
+        // straight from the index. Sorted iteration (BTreeMap) keeps the f64 sums bit-identical.
+        let mut counts: BTreeMap<&str, i32> = BTreeMap::new();
+        for (i, &term) in query.iter().enumerate() {
+            let occ = field_positions[i].len().min(MAX_OCCURRENCES as usize) as i32;
+            if occ > 0 {
+                counts.entry(term).or_insert(occ);
+            }
+        }
+        if counts.is_empty() {
             return;
         }
-        let unique_count = unique.len() as i32;
-        let divider = (field.len() as i32).min(MAX_OCCURRENCES * unique_count);
+        let unique_count = counts.len() as i32;
+        let divider = field_len.min(MAX_OCCURRENCES * unique_count);
         if divider == 0 {
             return;
         }
-        let max_occurrence = (field.len() as i32).min(MAX_OCCURRENCES) as f64;
+        let max_occurrence = field_len.min(MAX_OCCURRENCES) as f64;
 
         let mut occurrence = 0.0;
         let mut absolute_occurrence = 0.0;
@@ -1096,21 +1154,12 @@ mod field_match {
         let mut total_weight: i64 = 0;
         let mut total_weighted_occurrences = 0.0;
         let mut total_significant_occurrences = 0.0;
-        let mut weighted: Vec<f64> = Vec::with_capacity(unique.len());
-        let mut significant: Vec<f64> = Vec::with_capacity(unique.len());
+        let mut weighted: Vec<f64> = Vec::with_capacity(counts.len());
+        let mut significant: Vec<f64> = Vec::with_capacity(counts.len());
 
-        for &term in &unique {
+        for (&term, &term_occurrences) in &counts {
             let (weight, significance) = term_stats[term];
             let weight = weight as f64;
-            let mut term_occurrences = 0;
-            for &field_term in field {
-                if field_term == term {
-                    term_occurrences += 1;
-                    if term_occurrences == MAX_OCCURRENCES {
-                        break;
-                    }
-                }
-            }
             let occ = term_occurrences as f64;
             occurrence += occ / divider as f64;
             absolute_occurrence += occ / (MAX_OCCURRENCES * unique_count) as f64;
@@ -1148,13 +1197,16 @@ mod field_match {
         };
     }
 
-    pub(super) fn compute(
-        query: &[&str],
-        field: &[&str],
-        weights: &[i32],
-        significances: &[f64],
+    /// `field_positions[i]` = field indices of `query[i]` (from the document's index), so the
+    /// segmentation search skips straight to occurrences instead of rescanning the field.
+    pub(super) fn compute<'a>(
+        query: &'a [&'a str],
+        field_positions: Vec<&'a [usize]>,
+        field_len: i32,
+        weights: &'a [i32],
+        significances: &'a [f64],
     ) -> FieldMatch {
-        if query.is_empty() || field.is_empty() {
+        if query.is_empty() || field_len == 0 {
             return FieldMatch::default();
         }
         let total_term_weight: f64 = weights.iter().map(|&w| w as f64).sum();
@@ -1162,12 +1214,13 @@ mod field_match {
 
         let mut computer = Computer {
             query,
-            field,
+            field_len,
             weights,
             significances,
+            field_positions,
             metrics: Metrics::new(
                 query.len() as i32,
-                field.len() as i32,
+                field_len,
                 total_term_weight,
                 total_significance,
             ),
@@ -1185,7 +1238,13 @@ mod field_match {
                 .entry(term)
                 .or_insert((weights[idx], significances[idx]));
         }
-        occurrence_counts(query, field, &term_stats, &mut m);
+        occurrence_counts(
+            query,
+            &computer.field_positions,
+            field_len,
+            &term_stats,
+            &mut m,
+        );
         m.on_complete();
 
         FieldMatch {
@@ -1218,6 +1277,69 @@ mod field_match {
             weighted_occurrence: m.weighted_occurrence,
             weighted_absolute_occurrence: m.weighted_absolute_occurrence,
             significant_occurrence: m.significant_occurrence,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{closest_match, semantic_distance_to_field_index};
+
+        fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+            let mut s = seed;
+            move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            }
+        }
+
+        /// Trivial O(field·dist) reference for `closest_match`: walk distances ascending, map each to
+        /// a field index, compare. Deliberately the obvious-correct form — never optimized — so it
+        /// stays a valid equivalence oracle as `closest_match` evolves (e.g. a future binary search).
+        fn closest_reference(term: &str, field: &[&str], previous_j: i32, start: i32) -> i32 {
+            let field_len = field.len() as i32;
+            for distance in start..field_len {
+                let j = semantic_distance_to_field_index(distance, previous_j, field_len);
+                if j >= 0 && term == field[j as usize] {
+                    return distance;
+                }
+            }
+            -1
+        }
+
+        /// Equivalence property: the optimized `closest_match` (indexed path *and* the
+        /// `previous_j == -1` scan fallback) must equal the trivial reference for every `previous_j`
+        /// (incl. -1) and `start`. Guards future optimizations of the search, not just this rewrite.
+        #[test]
+        fn closest_match_matches_reference() {
+            let mut rng = xorshift(0x0C0FFEE0BADF00D5);
+            let vocab = ["a", "b", "c", "d", "e", "f", "g", "h"];
+            for _ in 0..200_000 {
+                let flen = (rng() % 48) as usize;
+                let field: Vec<&str> = (0..flen)
+                    .map(|_| vocab[(rng() >> 8) as usize % vocab.len()])
+                    .collect();
+                let field_len = flen as i32;
+                let term = vocab[(rng() >> 8) as usize % vocab.len()];
+                let previous_j = ((rng() >> 8) % (flen as u64 + 1)) as i32 - 1; // covers -1
+                let start = if flen == 0 {
+                    0
+                } else {
+                    ((rng() >> 8) % flen as u64) as i32
+                };
+                let positions: Vec<usize> = field
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &t)| t == term)
+                    .map(|(j, _)| j)
+                    .collect();
+                assert_eq!(
+                    closest_match(&positions, previous_j, start, field_len),
+                    closest_reference(term, &field, previous_j, start),
+                    "field={field:?} term={term} previous_j={previous_j} start={start}"
+                );
+            }
         }
     }
 }
@@ -1398,6 +1520,19 @@ mod tests {
             "score {}",
             m.score
         );
+    }
+
+    #[test]
+    fn test_field_match_occurrence_cap() {
+        // A term occurring past MAX_OCCURRENCES (100) must saturate. Field = 150×"foo":
+        // occ capped 150→100, divider = min(150, 100·1) = 100, so occurrence = absolute_occurrence
+        // = 1.0 (uncapped it would be 150/100 = 1.5).
+        let field = vec!["foo"; 150].join(" ");
+        let m = field_match(&analyzed("foo"), &analyzed(&field), |_| {
+            TermStats::default()
+        });
+        approx_eq(m.occurrence, 1.0);
+        approx_eq(m.absolute_occurrence, 1.0);
     }
 
     #[test]

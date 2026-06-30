@@ -13,3 +13,10 @@ publish = false
 
 [dependencies]
 alyze = { path = ".." }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "field_match"
+harness = false
