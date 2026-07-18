@@ -165,6 +165,21 @@ impl Analyzer {
         &self,
         inputs: impl Iterator<Item = &'a str>,
         buffer: &mut ReusableBuffer,
+        callback: impl FnMut(Token<'_>) -> bool,
+    ) {
+        // Branch once here so case-sensitive and case-folding analyses monomorphize separately —
+        // the case-sensitive path carries none of the casing/uppercase-bit code.
+        if self.options.case_sensitive {
+            self.analyze_dispatch::<false>(inputs, buffer, callback);
+        } else {
+            self.analyze_dispatch::<true>(inputs, buffer, callback);
+        }
+    }
+
+    fn analyze_dispatch<'a, const CASE_FOLD: bool>(
+        &self,
+        inputs: impl Iterator<Item = &'a str>,
+        buffer: &mut ReusableBuffer,
         mut callback: impl FnMut(Token<'_>) -> bool,
     ) {
         let ReusableBuffer {
@@ -190,7 +205,10 @@ impl Analyzer {
         for (input_index, input) in inputs.enumerate() {
             let mut prev = None;
             let input_as_bytes = input.as_bytes();
-            uax29::word::tokenize(input, tokenizer_opts, |bp, props| {
+
+            // CASE_FOLD doubles as ASCII_UPPERCASE here: case-folding is the only reason we ever
+            // need the uppercase bit, so passing it straight through avoids a second branch.
+            uax29::word::tokenize_impl::<CASE_FOLD>(input, tokenizer_opts, |bp, props| {
                 let Some(prev) = std::mem::replace(&mut prev, Some(bp)) else {
                     return true; // don't emit token on first breakpoint
                 };
@@ -202,8 +220,7 @@ impl Analyzer {
                 let position = next_position;
                 next_position += 1;
 
-                // SAFETY: tokenize guarentees that breakpoints are on valid UTF-8 boundaries,
-                // thus slicing input by the breakpoint will always produce valid UTF-8.
+                // SAFETY: tokenize guarantees breakpoints land on UTF-8 boundaries.
                 buffer_a.clear();
                 let mut token_text = InputRefOrBuffered::InputRef {
                     input: unsafe { std::str::from_utf8_unchecked(&input_as_bytes[prev..bp]) },
@@ -217,15 +234,9 @@ impl Analyzer {
                     return true;
                 }
 
-                // Lowercasing
-                if !self.options.case_sensitive && (!props.is_ascii() || props.has_ascii_upper()) {
-                    token_text.lowercase_in_place(props.is_ascii());
-                } else if !self.options.case_sensitive {
-                    // Skipped because props said all-lowercase ASCII; verify that holds.
-                    debug_assert!(
-                        !token_text.as_str().bytes().any(|b| b.is_ascii_uppercase()),
-                        "has_ascii_upper was false but token contains uppercase ASCII"
-                    );
+                // Lowercasing; see TokenProperties::has_ascii_uppercase for the skip rationale.
+                if CASE_FOLD {
+                    token_text.lowercase_in_place(props.is_ascii(), props.has_ascii_uppercase());
                 }
 
                 // Stopword removal
@@ -240,16 +251,15 @@ impl Analyzer {
                     token_text.stem_in_place(stemmer, stemming_cache, buffer_b);
                 }
 
-                // ASCII folding
-                // Note: Not needed if token is already ASCII
+                // ASCII folding (skipped if already ASCII)
                 if self.options.ascii_folding && !props.is_ascii() {
                     token_text.ascii_fold_in_place(buffer_b);
 
-                    // ASCII folding can produce uppercase ASCII characters,
-                    // so we'll lowercase again if case folding is enabled.
-                    if !self.options.case_sensitive {
+                    // Folding can produce uppercase ASCII; the tokenizer's hint doesn't cover
+                    // these new bytes, so always re-lowercase rather than trust it.
+                    if CASE_FOLD {
                         let is_ascii = token_text.as_str().is_ascii();
-                        token_text.lowercase_in_place(is_ascii);
+                        token_text.lowercase_in_place_slow(is_ascii);
                     }
                 }
 
@@ -301,17 +311,28 @@ impl InputRefOrBuffered<'_, '_> {
         }
     }
 
-    fn lowercase_in_place(&mut self, is_ascii: bool) {
+    /// Lowercases in place. `is_ascii` must match `self.as_str().is_ascii()`; `ascii_has_uppercase`
+    /// is `TokenProperties::has_ascii_uppercase` for this token — `false` leaves it untouched.
+    #[inline(always)]
+    fn lowercase_in_place(&mut self, is_ascii: bool, ascii_has_uppercase: bool) {
         debug_assert_eq!(
             is_ascii,
             self.as_str().is_ascii(),
             "caller must ensure is_ascii is correct"
         );
-
-        if is_ascii && self.as_str().bytes().all(|b| !b.is_ascii_uppercase()) {
+        if is_ascii && !ascii_has_uppercase {
+            debug_assert!(
+                !self.as_str().bytes().any(|b| b.is_ascii_uppercase()),
+                "uppercase hint must match the token's actual contents"
+            );
             return;
         }
+        self.lowercase_in_place_slow(is_ascii);
+    }
 
+    /// Out-of-line tail of [`lowercase_in_place`]: materializes a borrowed token into its buffer
+    /// before lowercasing. Split off so the fast-path wrapper stays small enough to inline.
+    fn lowercase_in_place_slow(&mut self, is_ascii: bool) {
         if let Self::InputRef {
             input,
             buffer_if_needed,

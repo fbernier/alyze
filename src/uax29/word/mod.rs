@@ -21,7 +21,7 @@ pub struct TokenProperties(u8);
 impl TokenProperties {
     const WORD_LIKE_MASK: u8 = 0b0000_0001;
     const NON_ASCII_MASK: u8 = 0b0000_0010;
-    const HAS_ASCII_UPPER_MASK: u8 = 0b0000_0100;
+    const ASCII_UPPERCASE_MASK: u8 = 0b0000_0100;
 
     pub(crate) const NON_ASCII: Self = Self(Self::NON_ASCII_MASK);
     pub(crate) const WORD_LIKE: Self = Self(Self::WORD_LIKE_MASK);
@@ -42,10 +42,11 @@ impl TokenProperties {
         self.0 & Self::NON_ASCII_MASK == 0
     }
 
-    // Stored disjunctively: a single ASCII uppercase byte (A–Z) in the span sets this bit.
-    // `has_ascii_upper()` returns true when the bit is set (vacuously false for the empty span).
-    pub fn has_ascii_upper(&self) -> bool {
-        self.0 & Self::HAS_ASCII_UPPER_MASK != 0
+    // Set when the span has an ASCII uppercase byte. Only `tokenize_impl::<true>` populates
+    // this — `tokenize` masks it out. Callers must still check `is_ascii()`: the bit says
+    // nothing about non-ASCII bytes in the same span.
+    pub(crate) fn has_ascii_uppercase(&self) -> bool {
+        self.0 & Self::ASCII_UPPERCASE_MASK != 0
     }
 }
 
@@ -59,7 +60,20 @@ impl std::ops::BitOrAssign for TokenProperties {
 /// A tokenizer that implements UAX #29 word boundary rules, using a deterministic finite automaton
 /// (DFA) to efficiently determine word boundaries in Unicode text. Includes a number of fast-paths
 /// for common cases, e.g. ASCII.
+#[inline]
 pub fn tokenize(
+    text: &str,
+    options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    // `false` masks `has_ascii_uppercase` out, so the public path stays byte-identical.
+    tokenize_impl::<false>(text, options, on_breakpoint)
+}
+
+/// `pub(crate)` so `analyze::Analyzer` can request the uppercase bit (`ASCII_UPPERCASE = true`)
+/// without a second named wrapper; `tokenize` above is the `false` instantiation.
+#[inline]
+pub(crate) fn tokenize_impl<const ASCII_UPPERCASE: bool>(
     text: &str,
     _options: Options,
     mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
@@ -94,6 +108,14 @@ pub fn tokenize(
     // they fold into the current token. Tracked by `deferred_break_pos.is_some()`.
     let mut deferred_props = TokenProperties::default();
 
+    // Low bits kept from `ASCII_BYTE_INFO`: the continue bit is scan bookkeeping, always masked
+    // off; the uppercase bit survives only in the `ASCII_UPPERCASE` monomorphization.
+    let contrib_mask = if ASCII_UPPERCASE {
+        !ASCII_WORD_CONTINUE
+    } else {
+        !(ASCII_WORD_CONTINUE | TokenProperties::ASCII_UPPERCASE_MASK)
+    };
+
     while pos < text.len() {
         // Fast path for ASCII, e.g. skip DFA all together when possible.
         // Roughly a ~2x speedup on English Wikipedia.
@@ -103,8 +125,11 @@ pub fn tokenize(
         ) {
             let scan_start = pos;
             let mut fast_acc: u8 = 0;
-            while pos < text.len() && bytes[pos] < 0x80 {
-                let info = ASCII_BYTE_INFO[bytes[pos] as usize];
+            for &b in &bytes[pos..] {
+                if b >= 0x80 {
+                    break;
+                }
+                let info = ASCII_BYTE_INFO[b as usize];
                 if info & ASCII_WORD_CONTINUE == 0 {
                     break;
                 }
@@ -112,7 +137,7 @@ pub fn tokenize(
                 pos += 1;
             }
             if pos > scan_start {
-                token_props.0 |= fast_acc & !ASCII_WORD_CONTINUE;
+                token_props.0 |= fast_acc & contrib_mask;
                 let last = bytes[pos - 1]; // Safe because we're not in State::StartOfText.
                 state = match last {
                     b'0'..=b'9' => State::Numeric,
@@ -135,7 +160,9 @@ pub fn tokenize(
                 b as char,
                 ASCII_WORD_BREAK_PROP[b as usize],
                 1usize,
-                TokenProperties(ASCII_BYTE_INFO[b as usize] & !ASCII_WORD_CONTINUE),
+                // Same `ASCII_BYTE_INFO` table the fast-lane scan reads, so the single-char branch
+                // and the run can't disagree on a byte's word-like / uppercase contribution.
+                TokenProperties(ASCII_BYTE_INFO[b as usize] & contrib_mask),
             )
         } else {
             let c = text[pos..].chars().next().unwrap();
@@ -245,21 +272,21 @@ const WORD_BREAK_CONTRIB: [TokenProperties; WordBreakProperty::NUM_VARIANTS] = {
 
 /// Per-ASCII-byte info for the fast-path scan and the single-char branch.
 /// - Bit 7 (`ASCII_WORD_CONTINUE`): byte is part of a word-like run (`[a-zA-Z0-9_]`).
-/// - Low bits: the byte's `TokenProperties` contribution (`WORD_LIKE_MASK` for `[a-zA-Z0-9]`,
-///   since underscore continues the run but isn't itself word-like, plus
-///   `HAS_ASCII_UPPER_MASK` for `[A-Z]`).
+/// - Low bits: the byte's `TokenProperties` contribution — `WORD_LIKE_MASK` for `[a-zA-Z0-9]`
+///   (underscore continues the run but isn't itself word-like), plus `ASCII_UPPERCASE_MASK` for
+///   `[A-Z]` so the uppercase signal rides along the load the scan already does.
 const ASCII_WORD_CONTINUE: u8 = 0b1000_0000;
 const ASCII_BYTE_INFO: [u8; 128] = {
     let mut t = [0u8; 128];
     let mut i = 0u8;
     loop {
         t[i as usize] = match i {
-            b'a'..=b'z' | b'0'..=b'9' => ASCII_WORD_CONTINUE | TokenProperties::WORD_LIKE_MASK,
             b'A'..=b'Z' => {
                 ASCII_WORD_CONTINUE
                     | TokenProperties::WORD_LIKE_MASK
-                    | TokenProperties::HAS_ASCII_UPPER_MASK
+                    | TokenProperties::ASCII_UPPERCASE_MASK
             }
+            b'a'..=b'z' | b'0'..=b'9' => ASCII_WORD_CONTINUE | TokenProperties::WORD_LIKE_MASK,
             b'_' => ASCII_WORD_CONTINUE,
             _ => 0,
         };
@@ -273,7 +300,7 @@ const ASCII_BYTE_INFO: [u8; 128] = {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, tokenize};
+    use super::{Options, tokenize, tokenize_impl};
     use crate::uax29::test_helpers::test_against_uax29_break_tests;
 
     #[test]
@@ -427,30 +454,6 @@ mod tests {
         assert_props("ab🛑", vec![(0, true), (2, true), (6, false)]);
     }
 
-    #[test]
-    fn tokenizer_has_ascii_upper_sanity() {
-        // Each emit reports properties of the span just closed; the leading boundary at 0 has
-        // no preceding span, so has_ascii_upper is vacuously false.
-        fn assert_has_ascii_upper(s: &str, expected: Vec<(usize, bool)>) {
-            let mut got: Vec<(usize, bool)> = Vec::new();
-            tokenize(s, Options::default(), |bp, props| {
-                got.push((bp, props.has_ascii_upper()));
-                true
-            });
-            assert_eq!(got, expected, "input: {:?}", s);
-        }
-
-        assert_has_ascii_upper("hello", vec![(0, false), (5, false)]);
-        assert_has_ascii_upper("Hello", vec![(0, false), (5, true)]);
-        assert_has_ascii_upper("HELLO", vec![(0, false), (5, true)]);
-        assert_has_ascii_upper("aB", vec![(0, false), (2, true)]);
-        assert_has_ascii_upper("123", vec![(0, false), (3, false)]);
-
-        // The breaking char is non-ASCII but starts the *next* token, so "ab" must still
-        // report has_ascii_upper=false.
-        assert_has_ascii_upper("ab🛑", vec![(0, false), (2, false), (6, false)]);
-    }
-
     fn assert_word_like(s: &str, expected: Vec<(usize, bool)>) {
         let mut got: Vec<(usize, bool)> = Vec::new();
         tokenize(s, Options::default(), |bp, props| {
@@ -477,6 +480,71 @@ mod tests {
         assert_word_like("   ", vec![(0, false), (3, false)]);
         // ASCII punctuation: each '!' breaks separately, none word-like.
         assert_word_like("!!!", vec![(0, false), (1, false), (2, false), (3, false)]);
+    }
+
+    /// Differential check for `has_ascii_uppercase`: every emitted span must agree with a
+    /// byte-level scan, and `tokenize`'s masked-off bit must always read false. Covers DFA edge
+    /// cases (deferred breaks, ZWJ, ExtendNumLet, mixed scripts) plus a PRNG fuzz pass.
+    #[test]
+    fn has_ascii_uppercase_matches_reference_scan() {
+        fn check(s: &str) {
+            let bytes = s.as_bytes();
+            let mut prev = 0;
+            tokenize_impl::<true>(s, Options::default(), |bp, props| {
+                let span = &bytes[prev..bp];
+                let expected = span.iter().any(|b| b.is_ascii_uppercase());
+                assert_eq!(
+                    props.has_ascii_uppercase(),
+                    expected,
+                    "input {:?}, span {:?}",
+                    s,
+                    std::str::from_utf8(span).unwrap_or("<invalid>")
+                );
+                prev = bp;
+                true
+            });
+
+            // The plain `tokenize` entry point masks the bit off, so it never reports uppercase.
+            tokenize(s, Options::default(), |_, props| {
+                assert!(
+                    !props.has_ascii_uppercase(),
+                    "plain tokenize must not report uppercase: {:?}",
+                    s
+                );
+                true
+            });
+        }
+
+        for s in [
+            "hello world",
+            "Hello WORLD",
+            "e.g. Hello",
+            "won't Can'T",
+            "A",
+            "abcdefghijK",
+            "abcdefgH iJ",
+            "a_B c_D",
+            "Café société",
+            "👨\u{200D}👩 ABC",
+            "א'א Test",
+            "אקספרס\u{05F4} מהיום Word",
+            "123ABC456def",
+        ] {
+            check(s);
+        }
+
+        let mut next = crate::uax29::test_helpers::xorshift32(0x9E3779B9);
+        let alphabet: &[char] = &[
+            'a', 'b', 'z', 'A', 'B', 'Z', '0', '9', '_', ' ', '.', '\'', 'ー', 'ש', '👨',
+            '\u{200D}',
+        ];
+        for _ in 0..500 {
+            let len = 1 + (next() % 12) as usize;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            check(&s);
+        }
     }
 
     /// Strict cases that need Script / Ideographic / OtherNumber / ExtPict lookups beyond the

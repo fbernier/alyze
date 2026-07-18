@@ -170,4 +170,17 @@ pub(crate) mod test_helpers {
         }
         (passed, failures.len())
     }
+
+    /// Deterministic xorshift32 PRNG for differential-test fuzzing, avoiding a `rand` dependency.
+    /// Zero seed is remapped to a fixed nonzero constant — xorshift32's absorbing state otherwise
+    /// never advances.
+    pub fn xorshift32(seed: u32) -> impl FnMut() -> u32 {
+        let mut state = if seed == 0 { 0x9E3779B9 } else { seed };
+        move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        }
+    }
 }
