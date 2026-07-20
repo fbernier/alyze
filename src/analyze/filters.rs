@@ -1,4 +1,5 @@
 use crate::analyze::{LanguageWithStopwords, stopwords, u17_to_lower::unicode_v17_char_to_lower};
+use crate::uax29::word::TokenProperties;
 
 // The maximum byte length of a character, after lowercasing.
 // Verified with `test_max_unicode_lowercased_length`.
@@ -39,9 +40,35 @@ pub(crate) fn lowercase_chars_in_place(s: &mut String) {
     s.drain(..original_byte_length);
 }
 
-pub(crate) fn within_token_length_limit(s: &str, maximum_token_length: usize) -> bool {
-    maximum_token_length > 0
-        && (s.len() <= maximum_token_length || s.chars().nth(maximum_token_length).is_none())
+/// The limit is on the token's *char* count, so the over-length case used to fall back to
+/// `chars().nth()` — an O(n) UTF-8 walk — to distinguish "too many bytes" from "too many chars".
+/// `props` removes that walk for ASCII spans, where byte length equals char count, so a byte length
+/// already over the limit puts the char count over it too.
+///
+/// Takes `TokenProperties` rather than a bare `is_ascii: bool` deliberately: the tokenizer already
+/// classified the span during the scan, so this is the value that carries the guarantee. A `bool`
+/// here would be a second, unchecked encoding of the same fact that any caller could get backwards.
+pub(crate) fn within_token_length_limit(
+    s: &str,
+    maximum_token_length: usize,
+    props: TokenProperties,
+) -> bool {
+    debug_assert_eq!(
+        props.is_ascii(),
+        s.is_ascii(),
+        "props must describe `s`: the span was classified during tokenization"
+    );
+
+    if maximum_token_length == 0 {
+        return false;
+    }
+    if s.len() <= maximum_token_length {
+        return true;
+    }
+    if props.is_ascii() {
+        return false;
+    }
+    s.chars().nth(maximum_token_length).is_none()
 }
 
 pub(crate) fn is_stopword_in_language(language: LanguageWithStopwords, token: &str) -> bool {
@@ -1609,9 +1636,37 @@ fn fold_non_ascii_char(c: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use crate::analyze::{
-        filters::{MAX_LOWERCASED_BYTE_LENGTH, is_english_stopword, lowercase_chars_in_place},
+        filters::{
+            MAX_LOWERCASED_BYTE_LENGTH, is_english_stopword, lowercase_chars_in_place,
+            within_token_length_limit,
+        },
         u17_to_lower::unicode_v17_char_to_lower,
     };
+
+    #[test]
+    fn test_within_token_length_limit() {
+        use crate::uax29::word::TokenProperties;
+        // `default()` has the non-ASCII bit unset, i.e. `is_ascii() == true`.
+        let ascii = TokenProperties::default();
+        let non_ascii = TokenProperties::NON_ASCII;
+
+        // max_token_length == 0 always rejects, even the empty string.
+        assert!(!within_token_length_limit("", 0, ascii));
+        assert!(!within_token_length_limit("a", 0, ascii));
+
+        // ASCII: byte length == char count, so the shortcut applies both ways.
+        assert!(within_token_length_limit("abcd", 4, ascii));
+        assert!(!within_token_length_limit("abcde", 4, ascii));
+
+        // Non-ASCII where byte length exceeds the limit but char count doesn't: the ASCII shortcut
+        // must never fire here, or this would wrongly reject a within-limit token.
+        // "café" is 5 bytes (é is 2 bytes) but 4 chars.
+        assert!(within_token_length_limit("café", 4, non_ascii));
+        // "ça" is 3 bytes (ç is 2 bytes) but 2 chars.
+        assert!(within_token_length_limit("ça", 2, non_ascii));
+        // 5-char non-ASCII string over a 4-char limit is correctly rejected.
+        assert!(!within_token_length_limit("cafés", 4, non_ascii));
+    }
 
     #[test]
     fn test_max_unicode_lowercased_length() {

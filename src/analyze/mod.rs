@@ -212,7 +212,11 @@ impl Analyzer {
 
                 // Token length
                 if let Some(max_token_length) = self.options.maximum_token_length
-                    && !filters::within_token_length_limit(token_text.as_str(), max_token_length)
+                    && !filters::within_token_length_limit(
+                        token_text.as_str(),
+                        max_token_length,
+                        props,
+                    )
                 {
                     return true;
                 }
