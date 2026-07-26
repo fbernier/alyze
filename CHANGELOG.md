@@ -2,6 +2,10 @@
 
 ## July 26, 2026
 
+- `uax29::word`: much faster ASCII word tokenization. The hot scan now uses SIMD backends (SSE2 on
+  x86-64, NEON on aarch64, portable SWAR elsewhere), and a fused fast-path emits the common
+  `word`/space alternation without re-entering the DFA. No build flags needed — every backend is
+  part of its target's baseline ABI. Output is byte-for-byte identical — purely a throughput change.
 - `uax29::sentence`: much faster tokenization on ASCII-heavy text. The scanner now skips the
   per-byte property and transition-table loads for the interior of a sentence, classifying a machine
   word at a time and stopping only at bytes the DFA must actually inspect. Output is byte-for-byte
